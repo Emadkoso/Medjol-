@@ -3,7 +3,7 @@ import sqlite3
 import json
 import logging
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, Response
 import httpx
 from openpyxl import Workbook
@@ -21,6 +21,7 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 DB_NAME = "harvest.db"
 
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -37,7 +38,13 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
+
+
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
 
 async def send_telegram_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -48,6 +55,7 @@ async def send_telegram_message(chat_id: int, text: str):
                 logger.error(f"Telegram sendMessage failed {res.status_code}: {res.text}")
         except Exception as e:
             logger.error(f"Telegram sendMessage exception: {e}")
+
 
 async def send_telegram_document(chat_id: int, filename: str, content: bytes, caption: str = ""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -61,29 +69,88 @@ async def send_telegram_document(chat_id: int, filename: str, content: bytes, ca
         except Exception as e:
             logger.error(f"Telegram sendDocument exception: {e}")
 
+
+# ---------------------------------------------------------------------------
+# AI parsing (OpenRouter) — برومبت موسّع بأسلوب استدلال دقيق
+# ---------------------------------------------------------------------------
+
+def build_prompt(text: str, today_date: str, yesterday_date: str, day_before_date: str) -> str:
+    return f"""أنت محاسب خبير ودقيق جداً، متخصص بحسابات مزارع النخيل في الأردن (منطقة الأغوار). أسلوبك في التفكير منهجي: تقرأ النص كاملاً، تحدد كل رقم ومعناه، تتحقق من الحساب خطوة بخطوة قبل ما ترجع النتيجة، ولا تخمّن أبداً معلومة غير مذكورة.
+
+## منهجية التفكير المطلوبة (طبّقها داخلياً قبل الإخراج، دون كتابتها):
+1. اقرأ النص وحدد: كم مجموعة عمال؟ كل مجموعة كم عدد وبأي أجرة؟
+2. حدد كل بند مصاريف مذكور صراحة (بنزين، أكل، نقل، أدوات...).
+3. حدد التاريخ المقصود.
+4. احسب الأرقام النهائية بدقة رياضية، وتحقق من صحة الجمع والضرب قبل الإخراج.
+5. قيّم مدى اكتمال المعلومات قبل ما تقرر الـ confidence.
+
+## قواعد الحساب:
+- إذا أُعطي أجر بالساعة: الأجرة اليومية = عدد الساعات × سعر الساعة.
+- إذا وُجدت أكثر من مجموعة عمال بأجور مختلفة: اجمع كل العمال بـ workers_count، واحسب wage_per_worker كمتوسط مرجّح = (مجموع [عدد×أجرة] لكل مجموعة) ÷ (مجموع العمال). اذكر التفصيل الكامل بالـ notes.
+- إذا وُجدت مصاريف متعددة: اجمعها كلها برقم واحد بـ expenses، واذكر تفصيل كل بند بالـ notes.
+- الأرقام المكتوبة بالحروف العربية أو العامية (خمسطعش=15، عشرين=20، تلاتين=30...) حوّلها لأرقام.
+- تجاهل أي كلام غير مرتبط بالحسابات (تحيات، أسئلة عامة، دعاء...).
+
+## قواعد التاريخ (اليوم هو {today_date}):
+- بدون ذكر تاريخ → استخدم {today_date}
+- "امس" أو "أمس" → {yesterday_date}
+- "اول امس" أو "أول أمس" أو "قبل امس" → {day_before_date}
+- تاريخ محدد مذكور نصاً → حوّله لصيغة YYYY-MM-DD
+
+## تقييم confidence (كن صارماً وحذراً هنا، هذا أهم جزء):
+- "full": ذُكر عدد العمال وأجرتهم (أو ما يكفي لحسابها) بوضوح تام.
+- "partial": ذُكرت بعض الأرقام لكن ينقص عنصر أساسي (مثلاً عدد عمال بدون أي إشارة للأجرة، أو أجرة بدون عدد عمال). في هذه الحالة أرجع الأرقام المتوفرة فقط ولا تخترع الناقص، واملأ missing_info بدقة.
+- "none": النص لا يحتوي أي بيانات يومية مالية إطلاقاً (سؤال، تحية، طلب تقرير...).
+عند أي شك حقيقي بين full وpartial، اختر partial — الدقة أهم من اكتمال الشكل.
+
+## صيغة الإخراج: JSON فقط، بدون أي نص أو شرح أو Markdown قبله أو بعده:
+{{
+  "workers_count": عدد صحيح,
+  "wage_per_worker": رقم,
+  "expenses": رقم,
+  "date": "YYYY-MM-DD",
+  "notes": "شرح موجز لأي حساب غير مباشر (متوسطات، بنود مصاريف)",
+  "confidence": "full" | "partial" | "none",
+  "missing_info": "وصف قصير لما هو ناقص، أو نص فارغ إذا لا شيء ناقص"
+}}
+
+## أمثلة توضيحية:
+
+النص: "اشتغل معي 23 عامل لمدة 6 ساعات اجرة الساعة الواحدة دينار ونصف"
+التفكير: 23 عامل، 6 ساعات × 1.5 د = 9 د للعامل، لا مصاريف مذكورة، لا تاريخ مذكور → اليوم.
+الإخراج: {{"workers_count": 23, "wage_per_worker": 9.0, "expenses": 0, "date": "{today_date}", "notes": "6 ساعات × 1.5 دينار/ساعة = 9 دينار للعامل", "confidence": "full", "missing_info": ""}}
+
+النص: "امس اشتغلوا 10 عمال باجرة 12 دينار و5 عمال باجرة 15 دينار، وصرفنا 20 دينار بنزين و10 دينار أكل"
+التفكير: مجموع العمال = 15. المتوسط المرجّح = (10×12 + 5×15)/15 = (120+75)/15 = 13. المصاريف = 20+10 = 30. التاريخ = أمس.
+الإخراج: {{"workers_count": 15, "wage_per_worker": 13.0, "expenses": 30, "date": "{yesterday_date}", "notes": "10 عمال بـ12 دينار + 5 عمال بـ15 دينار = متوسط 13 دينار للعامل. المصاريف: 20 بنزين + 10 أكل", "confidence": "full", "missing_info": ""}}
+
+النص: "اشتغل اليوم خمسطعش عامل"
+التفكير: عدد العمال معروف (15) لكن الأجرة غير مذكورة إطلاقاً → partial.
+الإخراج: {{"workers_count": 15, "wage_per_worker": 0, "expenses": 0, "date": "{today_date}", "notes": "", "confidence": "partial", "missing_info": "لم تُذكر أجرة العامل"}}
+
+النص: "شو الجو اليوم؟"
+التفكير: لا توجد أي بيانات مالية أو عمالية.
+الإخراج: {{"workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "{today_date}", "notes": "", "confidence": "none", "missing_info": "لا توجد بيانات يومية بالنص"}}
+
+النص الحالي المطلوب تحليله: "{text}"
+"""
+
+
 async def parse_with_ai(text: str) -> dict:
     if not OPENROUTER_API_KEY:
         logger.error("OPENROUTER_API_KEY is missing from environment variables!")
         return {}
 
-    prompt = f"""
-أنت مساعد مالي ذكي لمزرعة نخل. حلل النص التالي واحتسب الأجرة اليومية الإجمالية للعامل الواحد حتى لو أُعطيت بسعر الساعة وعدد الساعات (مثال: 6 ساعات × 1.5 دينار = 9 دنانير للعامل).
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    yesterday_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    day_before_str = (today - timedelta(days=2)).strftime("%Y-%m-%d")
 
-قم بإرجاع JSON حصراً بالصيغة التالية بدون أي كلام إضافي:
-{{
-  "workers_count": عدد العمال (عدد صحيح),
-  "wage_per_worker": إجمالي أجرة العامل الواحد لليوم بالدينار (عدد),
-  "expenses": المصاريف الإضافية (عدد),
-  "notes": "أي ملاحظات أو تفاصيل"
-}}
-
-النص: "{text}"
-    """
+    prompt = build_prompt(text, today_str, yesterday_str, day_before_str)
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        # اختياري لكن موصى فيه من OpenRouter لتحديد هوية التطبيق
         "HTTP-Referer": "https://medjol.onrender.com",
         "X-Title": "Medjol Farm Bot"
     }
@@ -91,7 +158,7 @@ async def parse_with_ai(text: str) -> dict:
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"}
     }
 
@@ -106,15 +173,20 @@ async def parse_with_ai(text: str) -> dict:
             if res.status_code == 200:
                 result = res.json()
                 content = result['choices'][0]['message']['content']
-                logger.info(f"OpenRouter raw response: {content}")
+                logger.info(f"AI raw response: {content}")
                 return json.loads(content)
             else:
                 logger.error(f"OpenRouter API error {res.status_code}: {res.text}")
         except json.JSONDecodeError as e:
-            logger.error(f"OpenRouter returned invalid JSON: {e}")
+            logger.error(f"AI returned invalid JSON: {e}")
         except Exception as e:
-            logger.error(f"OpenRouter request exception: {e}")
+            logger.error(f"AI request exception: {e}")
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
 
 def generate_pdf_report():
     conn = sqlite3.connect(DB_NAME)
@@ -178,6 +250,7 @@ def generate_pdf_report():
     pdf_bytes = HTML(string=html_content).write_pdf()
     return pdf_bytes
 
+
 def generate_excel_report():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -199,6 +272,11 @@ def generate_excel_report():
     wb.save(output)
     return output.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
+
 @app.post("/tg-webhook")
 async def telegram_webhook(request: Request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
@@ -213,37 +291,69 @@ async def telegram_webhook(request: Request):
         if text.startswith("/start"):
             await send_telegram_message(
                 chat_id,
-                "أهلاً بك في بوت إدارة حسابات المزرعة!\nيمكنك كتابة اليوميات بأي طريقة (مثال: اشتغل 23 عامل 6 ساعات الساعة بدينار ونص، أو: 5 عمال اليومية 12 دينار)."
+                "أهلاً بك في بوت إدارة حسابات المزرعة!\n"
+                "يمكنك كتابة اليوميات بأي طريقة، مثال:\n"
+                "- اشتغل 23 عامل 6 ساعات الساعة بدينار ونص\n"
+                "- امس 10 عمال باجرة 12 دينار و5 عمال باجرة 15 دينار، ومصاريف 30 دينار\n"
+                "أو اطلب 'تقرير PDF' أو 'تقرير اكسل'."
             )
-        elif "pdf" in text.lower() or "تقرير" in text:
+
+        elif "pdf" in text.lower() or "تقرير" in text and "اكسل" not in text.lower():
             pdf_data = generate_pdf_report()
             await send_telegram_document(chat_id, "report.pdf", pdf_data, "إليك تقرير الحسابات بصيغة PDF")
+
         elif "excel" in text.lower() or "اكسل" in text:
             excel_data = generate_excel_report()
             await send_telegram_document(chat_id, "report.xlsx", excel_data, "إليك تقرير الحسابات بصيغة Excel")
+
         else:
             parsed = await parse_with_ai(text)
-            w_count = parsed.get("workers_count", 0) or 0
-            wage = float(parsed.get("wage_per_worker", 0.0) or 0.0)
-            exp = float(parsed.get("expenses", 0.0) or 0.0)
-            notes = parsed.get("notes", "")
+            confidence = parsed.get("confidence", "none")
 
-            if w_count > 0 or wage > 0 or exp > 0:
-                today = datetime.now().strftime("%Y-%m-%d")
+            if confidence == "none":
+                await send_telegram_message(
+                    chat_id,
+                    "لم أفهم أي بيانات يومية بهذه الرسالة.\n"
+                    "اكتب مثلاً: 10 عمال اجرة 12 دينار ومصاريف 5 دينار."
+                )
+
+            elif confidence == "partial":
+                missing = parsed.get("missing_info", "بعض البيانات غير واضحة")
+                w_count = parsed.get("workers_count", 0) or 0
+                wage = parsed.get("wage_per_worker", 0) or 0
+                await send_telegram_message(
+                    chat_id,
+                    f"البيانات ناقصة: {missing}\n"
+                    f"(ما فهمته حتى الآن: عدد العمال = {w_count}, الأجرة = {wage})\n"
+                    f"يرجى إعادة الإرسال مع التفاصيل الكاملة."
+                )
+
+            else:  # full
+                w_count = parsed.get("workers_count", 0) or 0
+                wage = float(parsed.get("wage_per_worker", 0.0) or 0.0)
+                exp = float(parsed.get("expenses", 0.0) or 0.0)
+                notes = parsed.get("notes", "")
+                record_date = parsed.get("date") or datetime.now().strftime("%Y-%m-%d")
 
                 conn = sqlite3.connect(DB_NAME)
                 cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO daily_records (date, workers_count, wage_per_worker, expenses, notes) VALUES (?, ?, ?, ?, ?)",
-                    (today, w_count, wage, exp, notes)
+                    (record_date, w_count, wage, exp, notes)
                 )
                 conn.commit()
                 conn.close()
 
                 total = (w_count * wage) + exp
-                response_msg = f"تم تسجيل اليومية بنجاح!\n- عدد العمال: {w_count}\n- أجرة العامل اليومية: {wage:.2f} د.أ\n- المصاريف: {exp:.2f} د.أ\n- المجموع الكلي: {total:.2f} د.أ"
+                response_msg = (
+                    f"تم تسجيل اليومية بنجاح! ({record_date})\n"
+                    f"- عدد العمال: {w_count}\n"
+                    f"- أجرة العامل اليومية: {wage:.2f} د.أ\n"
+                    f"- المصاريف: {exp:.2f} د.أ\n"
+                    f"- المجموع الكلي: {total:.2f} د.أ"
+                )
+                if notes:
+                    response_msg += f"\n\nملاحظات: {notes}"
                 await send_telegram_message(chat_id, response_msg)
-            else:
-                await send_telegram_message(chat_id, "لم أتمكن من فهم البيانات. يرجى توضيح عدد العمال والأجرة أو طلب التقرير.")
 
     return {"status": "ok"}
