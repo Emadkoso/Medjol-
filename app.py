@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from io import BytesIO
+from datetime import datetime
 from fastapi import FastAPI, Request, Response
 import httpx
 from openpyxl import Workbook
@@ -168,7 +169,7 @@ def generate_excel_report():
     return output.getvalue()
 
 @app.post("/tg-webhook")
-async def telegram_webhook(request: Request"):
+async def telegram_webhook(request: Request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if TELEGRAM_WEBHOOK_SECRET and secret_header != TELEGRAM_WEBHOOK_SECRET:
         return Response(status_code=403)
@@ -192,7 +193,6 @@ async def telegram_webhook(request: Request"):
         else:
             parsed = await parse_with_groq(text)
             if parsed and (parsed.get("workers_count") or parsed.get("expenses")):
-                from datetime import datetime
                 today = datetime.now().strftime("%Y-%m-%d")
                 w_count = parsed.get("workers_count", 0) or 0
                 wage = parsed.get("wage_per_worker", 0.0) or 0.0
@@ -215,4 +215,4 @@ async def telegram_webhook(request: Request"):
                 await send_telegram_message(chat_id, "لم أتمكن من فهم البيانات. يرجى توضيح عدد العمال والأجرة أو طلب التقرير.")
                 
     return {"status": "ok"}
-
+    
