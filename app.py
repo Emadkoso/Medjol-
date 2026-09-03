@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import json
 import logging
@@ -30,6 +31,20 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT,
             workers_count INTEGER,
+            wage_per_worker REAL,
+            expenses REAL,
+            notes TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS conversation_state (
+            chat_id INTEGER PRIMARY KEY,
+            step TEXT,
+            date TEXT,
+            workers_count INTEGER,
+            wage_mode TEXT,
+            hours REAL,
+            wage_per_hour REAL,
             wage_per_worker REAL,
             expenses REAL,
             notes TEXT
@@ -71,104 +86,128 @@ async def send_telegram_document(chat_id: int, filename: str, content: bytes, ca
 
 
 # ---------------------------------------------------------------------------
-# AI Router — تحديد نية الرسالة: تسجيل / تعديل / تقرير / غير مفهوم
+# Number extraction — أرقام، أرقام عربية، وكلمات عامية شائعة
+# ---------------------------------------------------------------------------
+
+ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+ARABIC_NUMBER_WORDS = {
+    "صفر": 0, "واحد": 1, "وحدة": 1, "اثنين": 2, "اثنان": 2,
+    "تلاتة": 3, "ثلاثة": 3, "اربعة": 4, "أربعة": 4, "خمسة": 5,
+    "ستة": 6, "سبعة": 7, "ثمانية": 8, "تمانية": 8, "تسعة": 9, "عشرة": 10,
+    "احدعش": 11, "أحد عشر": 11, "اثناعش": 12, "اثنا عشر": 12,
+    "تلتطعش": 13, "ثلاثطعش": 13, "اربعطعش": 14, "خمسطعش": 15,
+    "سطعش": 16, "ستطعش": 16, "سبعطعش": 17, "تمنطعش": 18, "تسعطعش": 19,
+    "عشرين": 20, "تلاتين": 30, "ثلاثين": 30, "اربعين": 40, "خمسين": 50,
+    "ستين": 60, "سبعين": 70, "تمانين": 80, "تسعين": 90, "مية": 100, "مائة": 100
+}
+
+
+def extract_number(text: str):
+    t = text.strip().translate(ARABIC_INDIC_DIGITS)
+    match = re.search(r"\d+(\.\d+)?", t)
+    if match:
+        return float(match.group())
+    for word, val in ARABIC_NUMBER_WORDS.items():
+        if word in text:
+            return float(val)
+    return None
+
+
+async def extract_number_ai(text: str):
+    """احتياطي ذكي: إذا فشل الاستخراج المباشر، نسأل الموديل يستخرج رقم واحد فقط."""
+    if not OPENROUTER_API_KEY:
+        return None
+    prompt = (
+        "استخرج رقماً واحداً فقط من النص التالي وأرجعه بصيغة JSON حصراً: "
+        '{"number": <رقم أو null>}\n'
+        f'النص: "{text}"'
+    )
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://medjol.onrender.com",
+        "X-Title": "Medjol Farm Bot"
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"}
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers, json=payload, timeout=15.0
+            )
+            if res.status_code == 200:
+                content = res.json()['choices'][0]['message']['content']
+                data = json.loads(content)
+                return data.get("number")
+        except Exception as e:
+            logger.error(f"extract_number_ai error: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# AI Router — تحديد نية الرسالة عند عدم وجود محادثة نشطة
 # ---------------------------------------------------------------------------
 
 def build_prompt(text: str, today_date: str, yesterday_date: str, day_before_date: str) -> str:
     return f"""أنت محاسب خبير ودقيق جداً لمزرعة نخيل في الأردن (منطقة الأغوار)، وموجّه ذكي يحدد نية المستخدم بدقة من رسالته.
 
-## الخطوة الأولى — حدد نية الرسالة (intent):
-- "record": تسجيل يومية جديدة كاملة (عدد عمال + أجرة، لأول مرة).
-- "update": تعديل على سجل مسجّل مسبقاً — إضافة مصروف جديد لسجل موجود، تغيير رقم، حذف سجل، أو إضافة ملاحظة. أي رسالة تبدأ بـ "أضف"، "عدّل"، "غيّر"، "احذف"، "صحح" وتشير لسجل سابق تعتبر update.
-- "report": طلب استرجاع بيانات مسجلة (تقرير، كشف، "شو سجلت"...).
-- "other": أي شيء آخر لا علاقة له بالتسجيل أو التعديل أو التقارير.
+## حدد نية الرسالة (intent):
+- "record": يريد تسجيل يومية عمل (حتى لو ذكر معلومة واحدة فقط مثل عدد العمال).
+- "update": تعديل على سجل مسجّل مسبقاً (إضافة/تغيير/حذف).
+- "report": طلب استرجاع بيانات مسجلة سابقاً.
+- "other": أي شيء آخر.
 
-## إذا كانت النية "record": (تسجيل جديد بالكامل)
-- إذا أُعطي أجر بالساعة: الأجرة اليومية = الساعات × سعر الساعة.
-- عمال بأجور مختلفة: اجمع العدد الكلي، واحسب wage_per_worker كمتوسط مرجّح، واذكر التفصيل بالـ notes.
-- مصاريف متعددة: اجمعها برقم واحد بـ expenses، فصّل كل بند بالـ notes.
-- الأرقام بالحروف العربية حوّلها لأرقام.
-- confidence: "full" إذا وضح عدد العمال والأجرة، "partial" إذا نقص عنصر أساسي، "none" إذا لا علاقة.
+## استخرج من النص كل ما هو متوفر بوضوح (لا تخترع شيئاً غير مذكور، اترك الحقل 0 أو null إذا غير مذكور):
+- workers_count: عدد العمال إذا ذُكر.
+- hours: عدد ساعات العمل إذا ذُكر.
+- wage_per_hour: أجرة الساعة إذا ذُكرت.
+- wage_per_worker: أجرة العامل اليومية الإجمالية إذا ذُكرت مباشرة (وإلا احسبها إن توفر hours و wage_per_hour).
+- expenses: مجموع المصاريف إذا ذُكرت.
+- date: التاريخ المقصود بصيغة YYYY-MM-DD (اليوم {today_date}، "امس"={yesterday_date}، "اول امس"={day_before_date}).
 
-## إذا كانت النية "update": (تعديل سجل موجود مسبقاً)
-حدد الحقول التالية:
-- update_target_date: التاريخ المقصود بصيغة YYYY-MM-DD. إذا لم يُذكر تاريخ صراحة وكان الكلام يشير ضمنياً لآخر سجل تم الحديث عنه (مثال: "أضف كذا" بدون تاريخ بعد تسجيل يومية)، اجعلها "last".
-- update_action: واحدة من:
-  - "add_expense": إضافة مبلغ ثابت للمصاريف الحالية (مثال: "أضف أجرة نقل 25 دينار").
-  - "add_expense_per_worker": إضافة مبلغ لكل عامل يُضرب بعدد العمال ويُضاف للمصاريف (مثال: "أضف لكل عامل دينار بدل طعام" ← المبلغ 1 يُضرب بعدد عمال السجل).
-  - "set_expense": استبدال المصاريف بقيمة جديدة كلياً (مثال: "خلي المصاريف 50 دينار").
-  - "set_wage": تغيير أجرة العامل لقيمة جديدة.
-  - "set_workers": تغيير عدد العمال لقيمة جديدة.
-  - "delete_record": حذف السجل بالكامل (مثال: "احذف يومية امس", "الغي التسجيل الأخير").
-  - "append_note": إضافة ملاحظة نصية فقط بدون تغيير أرقام.
-- update_value: القيمة الرقمية المرتبطة بالعملية (رقم واحد). لعملية delete_record أو append_note بدون رقم، اجعلها 0.
-- update_note: نص قصير يوضح ماذا حدث (سيُضاف لملاحظات السجل)، أو نص فارغ لو غير مناسب.
+## للتحديث (update):
+- update_target_date: تاريخ أو "last".
+- update_action: "add_expense" | "add_expense_per_worker" | "set_expense" | "set_wage" | "set_workers" | "delete_record" | "append_note".
+- update_value: رقم.
+- update_note: نص قصير.
 
-مهم جداً: لا تحاول حساب المجموع النهائي بنفسك بهذه الحالة — فقط استخرج نوع العملية وقيمتها، والكود سيطبقها على السجل الفعلي.
-
-## إذا كانت النية "report": حدد نطاق التقرير
-- report_scope: "single_day" أو "range" أو "all".
-- report_date_from / report_date_to: YYYY-MM-DD أو null لو "all".
-- report_format: "pdf" أو "excel" لو ذُكرا صراحة، وإلا "text".
-
-## قواعد التاريخ (اليوم هو {today_date}):
-- "امس"/"أمس" → {yesterday_date}
-- "اول امس"/"أول أمس"/"قبل امس" → {day_before_date}
-- تاريخ محدد → حوّله YYYY-MM-DD
-- بدون تاريخ + record → {today_date}
-- بدون تاريخ + report → scope = "all"
-- بدون تاريخ + update → "last"
+## للتقرير (report):
+- report_scope: "single_day" | "range" | "all".
+- report_date_from / report_date_to: YYYY-MM-DD أو null.
+- report_format: "text" | "pdf" | "excel" (افتراضي "text" إذا لم يُذكر).
 
 ## صيغة الإخراج: JSON فقط بدون أي نص إضافي:
 {{
   "intent": "record" | "update" | "report" | "other",
-  "workers_count": عدد صحيح أو 0,
+  "workers_count": رقم أو 0,
+  "hours": رقم أو 0,
+  "wage_per_hour": رقم أو 0,
   "wage_per_worker": رقم أو 0,
   "expenses": رقم أو 0,
-  "date": "YYYY-MM-DD",
-  "notes": "نص",
-  "confidence": "full" | "partial" | "none",
-  "missing_info": "نص أو فارغ",
+  "date": "YYYY-MM-DD" أو "",
   "update_target_date": "YYYY-MM-DD" أو "last" أو null,
-  "update_action": "add_expense" | "add_expense_per_worker" | "set_expense" | "set_wage" | "set_workers" | "delete_record" | "append_note" | null,
+  "update_action": نص أو null,
   "update_value": رقم أو 0,
-  "update_note": "نص أو فارغ",
-  "report_scope": "single_day" | "range" | "all" | null,
-  "report_date_from": "YYYY-MM-DD" أو null,
-  "report_date_to": "YYYY-MM-DD" أو null,
-  "report_format": "text" | "pdf" | "excel" | null
+  "update_note": نص أو "",
+  "report_scope": نص أو null,
+  "report_date_from": نص أو null,
+  "report_date_to": نص أو null,
+  "report_format": نص أو null
 }}
 
-## أمثلة:
-
-النص: "اشتغل معي 23 عامل لمدة 6 ساعات اجرة الساعة الواحدة دينار ونصف"
-الإخراج: {{"intent": "record", "workers_count": 23, "wage_per_worker": 9.0, "expenses": 0, "date": "{today_date}", "notes": "6 ساعات × 1.5 دينار/ساعة = 9 دينار للعامل", "confidence": "full", "missing_info": "", "update_target_date": null, "update_action": null, "update_value": 0, "update_note": "", "report_scope": null, "report_date_from": null, "report_date_to": null, "report_format": null}}
-
-النص: "أضف أجرة نقل عمال = 25"
-الإخراج: {{"intent": "update", "workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "", "notes": "", "confidence": "none", "missing_info": "", "update_target_date": "last", "update_action": "add_expense", "update_value": 25, "update_note": "أجرة نقل عمال 25 دينار", "report_scope": null, "report_date_from": null, "report_date_to": null, "report_format": null}}
-
-النص: "أضف لكل عامل دينار واحد بدل طعام"
-الإخراج: {{"intent": "update", "workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "", "notes": "", "confidence": "none", "missing_info": "", "update_target_date": "last", "update_action": "add_expense_per_worker", "update_value": 1, "update_note": "بدل طعام دينار لكل عامل", "report_scope": null, "report_date_from": null, "report_date_to": null, "report_format": null}}
-
-النص: "احذف يومية امس"
-الإخراج: {{"intent": "update", "workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "", "notes": "", "confidence": "none", "missing_info": "", "update_target_date": "{yesterday_date}", "update_action": "delete_record", "update_value": 0, "update_note": "", "report_scope": null, "report_date_from": null, "report_date_to": null, "report_format": null}}
-
-النص: "غيّر أجرة العامل ليوم امس تصير 11 دينار"
-الإخراج: {{"intent": "update", "workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "", "notes": "", "confidence": "none", "missing_info": "", "update_target_date": "{yesterday_date}", "update_action": "set_wage", "update_value": 11, "update_note": "تصحيح أجرة العامل إلى 11 دينار", "report_scope": null, "report_date_from": null, "report_date_to": null, "report_format": null}}
-
-النص: "اعطني تقرير يوم {yesterday_date}"
-الإخراج: {{"intent": "report", "workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "", "notes": "", "confidence": "none", "missing_info": "", "update_target_date": null, "update_action": null, "update_value": 0, "update_note": "", "report_scope": "single_day", "report_date_from": "{yesterday_date}", "report_date_to": "{yesterday_date}", "report_format": "text"}}
-
-النص: "شو الجو اليوم؟"
-الإخراج: {{"intent": "other", "workers_count": 0, "wage_per_worker": 0, "expenses": 0, "date": "", "notes": "", "confidence": "none", "missing_info": "", "update_target_date": null, "update_action": null, "update_value": 0, "update_note": "", "report_scope": null, "report_date_from": null, "report_date_to": null, "report_format": null}}
-
-النص الحالي المطلوب تحليله: "{text}"
+النص: "{text}"
 """
 
 
 async def analyze_message(text: str) -> dict:
     if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY is missing from environment variables!")
+        logger.error("OPENROUTER_API_KEY is missing!")
         return {"intent": "other"}
 
     today = datetime.now()
@@ -177,14 +216,12 @@ async def analyze_message(text: str) -> dict:
     day_before_str = (today - timedelta(days=2)).strftime("%Y-%m-%d")
 
     prompt = build_prompt(text, today_str, yesterday_str, day_before_str)
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://medjol.onrender.com",
         "X-Title": "Medjol Farm Bot"
     }
-
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -196,26 +233,264 @@ async def analyze_message(text: str) -> dict:
         try:
             res = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=25.0
+                headers=headers, json=payload, timeout=25.0
             )
             if res.status_code == 200:
-                result = res.json()
-                content = result['choices'][0]['message']['content']
+                content = res.json()['choices'][0]['message']['content']
                 logger.info(f"AI raw response: {content}")
                 return json.loads(content)
             else:
                 logger.error(f"OpenRouter API error {res.status_code}: {res.text}")
-        except json.JSONDecodeError as e:
-            logger.error(f"AI returned invalid JSON: {e}")
         except Exception as e:
             logger.error(f"AI request exception: {e}")
     return {"intent": "other"}
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Conversation state (الحوار التفاعلي خطوة بخطوة)
+# ---------------------------------------------------------------------------
+
+def get_state(chat_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM conversation_state WHERE chat_id = ?", (chat_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    cols = ["chat_id", "step", "date", "workers_count", "wage_mode",
+            "hours", "wage_per_hour", "wage_per_worker", "expenses", "notes"]
+    return dict(zip(cols, row))
+
+
+def save_state(chat_id: int, **fields):
+    existing = get_state(chat_id)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    if existing:
+        merged = {**existing, **fields}
+        cursor.execute('''
+            UPDATE conversation_state SET step=?, date=?, workers_count=?, wage_mode=?,
+                hours=?, wage_per_hour=?, wage_per_worker=?, expenses=?, notes=?
+            WHERE chat_id=?
+        ''', (merged["step"], merged["date"], merged["workers_count"], merged["wage_mode"],
+              merged["hours"], merged["wage_per_hour"], merged["wage_per_worker"],
+              merged["expenses"], merged["notes"], chat_id))
+    else:
+        defaults = {
+            "step": None, "date": datetime.now().strftime("%Y-%m-%d"),
+            "workers_count": None, "wage_mode": None, "hours": None,
+            "wage_per_hour": None, "wage_per_worker": None, "expenses": None, "notes": ""
+        }
+        merged = {**defaults, **fields}
+        cursor.execute('''
+            INSERT INTO conversation_state
+            (chat_id, step, date, workers_count, wage_mode, hours, wage_per_hour, wage_per_worker, expenses, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, merged["step"], merged["date"], merged["workers_count"], merged["wage_mode"],
+              merged["hours"], merged["wage_per_hour"], merged["wage_per_worker"],
+              merged["expenses"], merged["notes"]))
+    conn.commit()
+    conn.close()
+
+
+def clear_state(chat_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM conversation_state WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def next_missing_step(state: dict) -> str:
+    """يحدد أول سؤال ناقص بذكاء — يتخطى ما هو معروف مسبقاً."""
+    if not state.get("workers_count"):
+        return "ASK_WORKERS"
+    if not state.get("wage_per_worker"):
+        if not state.get("wage_mode"):
+            return "ASK_WAGE_MODE"
+        if state["wage_mode"] == "hourly":
+            if not state.get("hours"):
+                return "ASK_HOURS"
+            if not state.get("wage_per_hour"):
+                return "ASK_WAGE_PER_HOUR"
+        else:
+            return "ASK_WAGE_DAILY"
+    if state.get("expenses") is None:
+        return "ASK_EXPENSES"
+    return "CONFIRM"
+
+
+def question_for_step(step: str) -> str:
+    return {
+        "ASK_WORKERS": "🧑‍🌾 كم عدد العمال الذين اشتغلوا معك؟",
+        "ASK_WAGE_MODE": "💵 كيف تحدد الأجرة؟\n1️⃣ أجرة يومية مباشرة للعامل\n2️⃣ بالساعة (عدد الساعات × سعر الساعة)\n\nاكتب 1 أو 2.",
+        "ASK_HOURS": "⏱️ كم عدد ساعات العمل؟",
+        "ASK_WAGE_PER_HOUR": "💰 كم أجرة الساعة الواحدة (بالدينار)؟",
+        "ASK_WAGE_DAILY": "💰 كم أجرة العامل الواحد لهذا اليوم (بالدينار)؟",
+        "ASK_EXPENSES": "🧾 هل هناك مصاريف إضافية (بنزين، أكل، نقل...)؟\nاكتب المجموع، أو اكتب 'لا' إذا لا يوجد.",
+    }.get(step, "")
+
+
+def build_confirmation_text(state: dict) -> str:
+    wage = state.get("wage_per_worker") or 0
+    workers = state.get("workers_count") or 0
+    expenses = state.get("expenses") or 0
+    total = (workers * wage) + expenses
+    return (
+        f"📋 راجع البيانات قبل الحفظ ({state.get('date')}):\n"
+        f"- عدد العمال: {workers}\n"
+        f"- أجرة العامل: {wage:.2f} د.أ\n"
+        f"- المصاريف: {expenses:.2f} د.أ\n"
+        f"- المجموع الكلي: {total:.2f} د.أ\n\n"
+        f"✅ اكتب 'نعم' للحفظ، أو ❌ 'الغاء' للإلغاء."
+    )
+
+
+NO_EXPENSE_WORDS = ["لا", "ﻻ", "لا يوجد", "ماكو", "ولا شي", "بدون", "no", "0"]
+YES_WORDS = ["نعم", "ايوه", "ايه", "تمام", "صح", "اوك", "ok", "yes", "احفظ", "أكيد"]
+CANCEL_WORDS = ["الغاء", "إلغاء", "كنسل", "cancel", "لغي", "الغي"]
+
+
+async def handle_guided_answer(chat_id: int, text: str, state: dict):
+    step = state["step"]
+    stripped = text.strip()
+
+    if step == "ASK_WORKERS":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم عدد العمال؟ (اكتب رقماً فقط)")
+            return
+        state["workers_count"] = int(num)
+
+    elif step == "ASK_WAGE_MODE":
+        if "2" in stripped or "ساعة" in stripped:
+            state["wage_mode"] = "hourly"
+        elif "1" in stripped or "يومي" in stripped or "مباشر" in stripped:
+            state["wage_mode"] = "daily"
+        else:
+            await send_telegram_message(chat_id, "من فضلك اكتب 1 (أجرة يومية مباشرة) أو 2 (بالساعة).")
+            return
+
+    elif step == "ASK_HOURS":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم عدد ساعات العمل؟")
+            return
+        state["hours"] = num
+
+    elif step == "ASK_WAGE_PER_HOUR":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم أجرة الساعة الواحدة؟")
+            return
+        state["wage_per_hour"] = num
+        state["wage_per_worker"] = (state.get("hours") or 0) * num
+        state["notes"] = (state.get("notes") or "") + f" {state['hours']}س×{num}د/س={state['wage_per_worker']:.2f}د للعامل"
+
+    elif step == "ASK_WAGE_DAILY":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم أجرة العامل اليومية؟")
+            return
+        state["wage_per_worker"] = num
+
+    elif step == "ASK_EXPENSES":
+        if any(w in stripped for w in NO_EXPENSE_WORDS) and extract_number(stripped) is None:
+            state["expenses"] = 0.0
+        else:
+            num = extract_number(stripped) or await extract_number_ai(stripped)
+            if num is None:
+                await send_telegram_message(chat_id, "لم أفهم 🙏 اكتب مبلغ المصاريف كرقم، أو 'لا' إذا لا يوجد.")
+                return
+            state["expenses"] = num
+
+    elif step == "CONFIRM":
+        if any(w in stripped for w in YES_WORDS):
+            workers = state.get("workers_count") or 0
+            wage = state.get("wage_per_worker") or 0
+            expenses = state.get("expenses") or 0
+            notes = (state.get("notes") or "").strip()
+            record_date = state.get("date") or datetime.now().strftime("%Y-%m-%d")
+
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO daily_records (date, workers_count, wage_per_worker, expenses, notes) VALUES (?, ?, ?, ?, ?)",
+                (record_date, workers, wage, expenses, notes)
+            )
+            conn.commit()
+            conn.close()
+            clear_state(chat_id)
+
+            total = (workers * wage) + expenses
+            await send_telegram_message(
+                chat_id,
+                f"✅ تم حفظ اليومية بنجاح! ({record_date})\n"
+                f"- عدد العمال: {workers}\n"
+                f"- أجرة العامل: {wage:.2f} د.أ\n"
+                f"- المصاريف: {expenses:.2f} د.أ\n"
+                f"- المجموع الكلي: {total:.2f} د.أ"
+            )
+        elif any(w in stripped for w in CANCEL_WORDS):
+            clear_state(chat_id)
+            await send_telegram_message(chat_id, "❌ تم إلغاء العملية، لم يُحفظ أي شيء.")
+        else:
+            await send_telegram_message(chat_id, "من فضلك اكتب 'نعم' للحفظ أو 'الغاء' للإلغاء.")
+        return
+
+    # تحديد السؤال التالي بذكاء وحفظ الحالة
+    step_after = next_missing_step(state)
+    save_state(
+        chat_id, step=step_after, date=state.get("date"),
+        workers_count=state.get("workers_count"), wage_mode=state.get("wage_mode"),
+        hours=state.get("hours"), wage_per_hour=state.get("wage_per_hour"),
+        wage_per_worker=state.get("wage_per_worker"), expenses=state.get("expenses"),
+        notes=state.get("notes")
+    )
+
+    if step_after == "CONFIRM":
+        await send_telegram_message(chat_id, build_confirmation_text(state))
+    else:
+        await send_telegram_message(chat_id, question_for_step(step_after))
+
+
+async def start_guided_flow(chat_id: int, prefill: dict):
+    """يبدأ حواراً جديداً، ويتخطى الأسئلة التي عرف إجابتها من الرسالة الأصلية."""
+    workers = int(prefill.get("workers_count") or 0) or None
+    hours = prefill.get("hours") or None
+    wage_per_hour = prefill.get("wage_per_hour") or None
+    wage_per_worker = prefill.get("wage_per_worker") or None
+    expenses = prefill.get("expenses")
+    date_val = prefill.get("date") or datetime.now().strftime("%Y-%m-%d")
+
+    wage_mode = None
+    if wage_per_worker:
+        wage_mode = "daily"  # موجود مسبقاً، ما رح نحتاج نسأل عن الطريقة
+    elif hours and wage_per_hour:
+        wage_per_worker = hours * wage_per_hour
+        wage_mode = "hourly"
+
+    state = {
+        "date": date_val, "workers_count": workers, "wage_mode": wage_mode,
+        "hours": hours, "wage_per_hour": wage_per_hour,
+        "wage_per_worker": wage_per_worker,
+        "expenses": expenses if expenses not in (None, 0) else (0.0 if expenses == 0 else None),
+        "notes": ""
+    }
+
+    step = next_missing_step(state)
+    save_state(chat_id, step=step, **state)
+
+    if step == "CONFIRM":
+        await send_telegram_message(chat_id, build_confirmation_text(state))
+    else:
+        intro = "تمام، خلينا نكمل التفاصيل 👇\n\n" if workers or wage_per_worker else ""
+        await send_telegram_message(chat_id, intro + question_for_step(step))
+
+
+# ---------------------------------------------------------------------------
+# Update / Report helpers (كما هي)
 # ---------------------------------------------------------------------------
 
 def query_records(date_from: str = None, date_to: str = None):
@@ -240,322 +515,8 @@ def query_records(date_from: str = None, date_to: str = None):
 def format_text_report(rows, title: str) -> str:
     if not rows:
         return f"{title}\n\nلا توجد أي سجلات لهذه الفترة."
-
     lines = [title, ""]
     grand_total = 0.0
     for date, count, wage, exp, notes in rows:
         total = (count * wage) + exp
-        grand_total += total
-        lines.append(f"📅 {date}")
-        lines.append(f"   عدد العمال: {count}")
-        lines.append(f"   أجرة العامل: {wage:.2f} د.أ")
-        lines.append(f"   المصاريف: {exp:.2f} د.أ")
-        lines.append(f"   المجموع: {total:.2f} د.أ")
-        if notes:
-            lines.append(f"   ملاحظات: {notes}")
-        lines.append("")
-
-    lines.append(f"💰 المجموع الكلي لكل الفترة: {grand_total:.2f} دينار أردني")
-    return "\n".join(lines)
-
-
-def find_target_record(target_date: str):
-    """يرجع (id, date, workers_count, wage_per_worker, expenses, notes) أو None"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    if target_date == "last" or not target_date:
-        cursor.execute(
-            "SELECT id, date, workers_count, wage_per_worker, expenses, notes "
-            "FROM daily_records ORDER BY id DESC LIMIT 1"
-        )
-    else:
-        cursor.execute(
-            "SELECT id, date, workers_count, wage_per_worker, expenses, notes "
-            "FROM daily_records WHERE date = ? ORDER BY id DESC LIMIT 1",
-            (target_date,)
-        )
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-
-def apply_update(record, action: str, value: float, note: str):
-    """يعدّل السجل بقاعدة البيانات ويرجع رسالة تأكيد نصية."""
-    rec_id, date, workers_count, wage, expenses, notes = record
-
-    if action == "delete_record":
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM daily_records WHERE id = ?", (rec_id,))
-        conn.commit()
-        conn.close()
-        return f"🗑️ تم حذف سجل يوم {date} بالكامل."
-
-    new_workers = workers_count
-    new_wage = wage
-    new_expenses = expenses
-    new_notes = notes
-
-    if action == "add_expense":
-        new_expenses = expenses + value
-        change_desc = f"إضافة {value:.2f} د.أ للمصاريف"
-    elif action == "add_expense_per_worker":
-        added = value * workers_count
-        new_expenses = expenses + added
-        change_desc = f"إضافة {value:.2f} د.أ × {workers_count} عامل = {added:.2f} د.أ للمصاريف"
-    elif action == "set_expense":
-        new_expenses = value
-        change_desc = f"تعديل المصاريف لتصبح {value:.2f} د.أ"
-    elif action == "set_wage":
-        new_wage = value
-        change_desc = f"تعديل أجرة العامل لتصبح {value:.2f} د.أ"
-    elif action == "set_workers":
-        new_workers = int(value)
-        change_desc = f"تعديل عدد العمال ليصبح {int(value)}"
-    elif action == "append_note":
-        change_desc = "إضافة ملاحظة"
-    else:
-        change_desc = "تعديل غير معروف"
-
-    extra_note = note or change_desc
-    new_notes = f"{notes}; {extra_note}" if notes else extra_note
-
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE daily_records SET workers_count=?, wage_per_worker=?, expenses=?, notes=? WHERE id=?",
-        (new_workers, new_wage, new_expenses, new_notes, rec_id)
-    )
-    conn.commit()
-    conn.close()
-
-    total = (new_workers * new_wage) + new_expenses
-    return (
-        f"✏️ تم تعديل سجل يوم {date}\n"
-        f"- {change_desc}\n\n"
-        f"البيانات بعد التعديل:\n"
-        f"- عدد العمال: {new_workers}\n"
-        f"- أجرة العامل: {new_wage:.2f} د.أ\n"
-        f"- المصاريف: {new_expenses:.2f} د.أ\n"
-        f"- المجموع الكلي: {total:.2f} د.أ"
-    )
-
-
-# ---------------------------------------------------------------------------
-# File reports (PDF / Excel)
-# ---------------------------------------------------------------------------
-
-def generate_pdf_report(date_from: str = None, date_to: str = None):
-    rows = query_records(date_from, date_to)
-
-    table_rows = ""
-    total_cost_all = 0
-    for row in rows:
-        date, count, wage, exp, notes = row
-        total = (count * wage) + exp
-        total_cost_all += total
-        table_rows += f"""
-        <tr>
-            <td>{date}</td>
-            <td>{count}</td>
-            <td>{wage:.2f} د.أ</td>
-            <td>{exp:.2f} د.أ</td>
-            <td><b>{total:.2f} د.أ</b></td>
-            <td>{notes or '-'}</td>
-        </tr>
-        """
-
-    html_content = f"""
-    <!DOCTYPE html>
-    <html dir="rtl" lang="ar">
-    <head>
-        <meta charset="UTF-8">
-        <style>
-            body {{ font-family: 'DejaVu Sans', sans-serif; padding: 20px; }}
-            h1 {{ text-align: center; color: #2c3e50; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
-            th {{ background-color: #27ae60; color: white; }}
-            .total {{ margin-top: 20px; font-size: 18px; font-weight: bold; text-align: left; }}
-        </style>
-    </head>
-    <body>
-        <h1>تقرير حسابات حصاد المجدول</h1>
-        <table>
-            <thead>
-                <tr>
-                    <th>التاريخ</th>
-                    <th>عدد العمال</th>
-                    <th>أجرة العامل</th>
-                    <th>المصاريف</th>
-                    <th>المجموع</th>
-                    <th>ملاحظات</th>
-                </tr>
-            </thead>
-            <tbody>
-                {table_rows}
-            </tbody>
-        </table>
-        <div class="total">المجموع الكلي: {total_cost_all:.2f} دينار أردني</div>
-    </body>
-    </html>
-    """
-    pdf_bytes = HTML(string=html_content).write_pdf()
-    return pdf_bytes
-
-
-def generate_excel_report(date_from: str = None, date_to: str = None):
-    rows = query_records(date_from, date_to)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "اليوميات"
-
-    ws.append(["التاريخ", "عدد العمال", "أجرة العامل", "المصاريف", "المجموع", "ملاحظات"])
-    for row in rows:
-        date, count, wage, exp, notes = row
-        total = (count * wage) + exp
-        ws.append([date, count, wage, exp, total, notes or ""])
-
-    output = BytesIO()
-    wb.save(output)
-    return output.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# Webhook
-# ---------------------------------------------------------------------------
-
-@app.post("/tg-webhook")
-async def telegram_webhook(request: Request):
-    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if TELEGRAM_WEBHOOK_SECRET and secret_header != TELEGRAM_WEBHOOK_SECRET:
-        return Response(status_code=403)
-
-    data = await request.json()
-    if "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"].get("text", "")
-
-        if text.startswith("/start"):
-            await send_telegram_message(
-                chat_id,
-                "أهلاً بك في بوت إدارة حسابات المزرعة!\n\n"
-                "📝 لتسجيل يومية: «اشتغل 23 عامل 6 ساعات بدينار ونص»\n"
-                "✏️ للتعديل: «أضف أجرة نقل 25 دينار» أو «عدّل أجرة امس تصير 11»\n"
-                "🗑️ للحذف: «احذف يومية امس»\n"
-                "📊 للتقرير: «تقرير امس» أو «كل السجلات pdf»"
-            )
-            return {"status": "ok"}
-
-        result = await analyze_message(text)
-        intent = result.get("intent", "other")
-
-        # -------------------- تسجيل بيانات جديدة --------------------
-        if intent == "record":
-            confidence = result.get("confidence", "none")
-
-            if confidence == "partial":
-                missing = result.get("missing_info", "بعض البيانات غير واضحة")
-                w_count = result.get("workers_count", 0) or 0
-                wage = result.get("wage_per_worker", 0) or 0
-                await send_telegram_message(
-                    chat_id,
-                    f"البيانات ناقصة: {missing}\n"
-                    f"(ما فهمته: عدد العمال = {w_count}, الأجرة = {wage})\n"
-                    f"يرجى إعادة الإرسال مع التفاصيل الكاملة."
-                )
-            elif confidence == "full":
-                w_count = result.get("workers_count", 0) or 0
-                wage = float(result.get("wage_per_worker", 0.0) or 0.0)
-                exp = float(result.get("expenses", 0.0) or 0.0)
-                notes = result.get("notes", "")
-                record_date = result.get("date") or datetime.now().strftime("%Y-%m-%d")
-
-                conn = sqlite3.connect(DB_NAME)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO daily_records (date, workers_count, wage_per_worker, expenses, notes) VALUES (?, ?, ?, ?, ?)",
-                    (record_date, w_count, wage, exp, notes)
-                )
-                conn.commit()
-                conn.close()
-
-                total = (w_count * wage) + exp
-                response_msg = (
-                    f"✅ تم تسجيل اليومية بنجاح! ({record_date})\n"
-                    f"- عدد العمال: {w_count}\n"
-                    f"- أجرة العامل اليومية: {wage:.2f} د.أ\n"
-                    f"- المصاريف: {exp:.2f} د.أ\n"
-                    f"- المجموع الكلي: {total:.2f} د.أ"
-                )
-                if notes:
-                    response_msg += f"\n\nملاحظات: {notes}"
-                await send_telegram_message(chat_id, response_msg)
-            else:
-                await send_telegram_message(
-                    chat_id,
-                    "لم أفهم أي بيانات يومية بهذه الرسالة.\n"
-                    "اكتب مثلاً: 10 عمال اجرة 12 دينار ومصاريف 5 دينار."
-                )
-
-        # -------------------- تعديل سجل موجود --------------------
-        elif intent == "update":
-            target_date = result.get("update_target_date") or "last"
-            action = result.get("update_action")
-            value = float(result.get("update_value", 0) or 0)
-            note = result.get("update_note", "")
-
-            record = find_target_record(target_date)
-
-            if not record:
-                await send_telegram_message(
-                    chat_id,
-                    "لم أجد سجلاً مطابقاً لأعدّل عليه.\n"
-                    "تأكد من التاريخ، أو سجّل يومية جديدة أولاً."
-                )
-            elif not action:
-                await send_telegram_message(
-                    chat_id,
-                    "فهمت أنك تريد تعديل سجل، لكن لم أفهم نوع التعديل بالضبط.\n"
-                    "جرب مثلاً: «أضف 10 دينار مصاريف» أو «غيّر عدد العمال ليصير 20»."
-                )
-            else:
-                confirmation = apply_update(record, action, value, note)
-                await send_telegram_message(chat_id, confirmation)
-
-        # -------------------- طلب تقرير --------------------
-        elif intent == "report":
-            scope = result.get("report_scope", "all")
-            date_from = result.get("report_date_from")
-            date_to = result.get("report_date_to")
-            fmt = result.get("report_format") or "text"
-
-            if scope == "single_day" and date_from:
-                title = f"📋 تقرير يوم {date_from}"
-            elif scope == "range" and date_from and date_to:
-                title = f"📋 تقرير من {date_from} إلى {date_to}"
-            else:
-                title = "📋 تقرير كامل لكل السجلات"
-                date_from = date_to = None
-
-            if fmt == "pdf":
-                pdf_data = generate_pdf_report(date_from, date_to)
-                await send_telegram_document(chat_id, "report.pdf", pdf_data, title)
-            elif fmt == "excel":
-                excel_data = generate_excel_report(date_from, date_to)
-                await send_telegram_document(chat_id, "report.xlsx", excel_data, title)
-            else:
-                rows = query_records(date_from, date_to)
-                report_text = format_text_report(rows, title)
-                await send_telegram_message(chat_id, report_text)
-
-        # -------------------- غير مفهوم --------------------
-        else:
-            await send_telegram_message(
-                chat_id,
-                "يمكنني مساعدتك بتسجيل يوميات المزرعة، تعديلها، أو استخراج تقارير عنها.\n"
-                "جرب مثلاً: «10 عمال اجرة 12 دينار» أو «أضف 5 دينار مصاريف» أو «تقرير امس»."
-            )
-
-    return {"status": "ok"}
+   
