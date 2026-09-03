@@ -1,11 +1,16 @@
 import os
 import sqlite3
+import json
+import logging
 from io import BytesIO
 from datetime import datetime
 from fastapi import FastAPI, Request, Response
 import httpx
 from openpyxl import Workbook
 from weasyprint import HTML
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("medjol")
 
 app = FastAPI()
 
@@ -36,19 +41,30 @@ init_db()
 async def send_telegram_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": chat_id, "text": text})
+        try:
+            res = await client.post(url, json={"chat_id": chat_id, "text": text})
+            if res.status_code != 200:
+                logger.error(f"Telegram sendMessage failed {res.status_code}: {res.text}")
+        except Exception as e:
+            logger.error(f"Telegram sendMessage exception: {e}")
 
 async def send_telegram_document(chat_id: int, filename: str, content: bytes, caption: str = ""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     files = {"document": (filename, content)}
     data = {"chat_id": chat_id, "caption": caption}
     async with httpx.AsyncClient() as client:
-        await client.post(url, data=data, files=files)
+        try:
+            res = await client.post(url, data=data, files=files)
+            if res.status_code != 200:
+                logger.error(f"Telegram sendDocument failed {res.status_code}: {res.text}")
+        except Exception as e:
+            logger.error(f"Telegram sendDocument exception: {e}")
 
 async def parse_with_groq(text: str) -> dict:
     if not GROQ_API_KEY:
+        logger.error("GROQ_API_KEY is missing from environment variables!")
         return {}
-    
+
     prompt = f"""
 أنت مساعد مالي ذكي لمزرعة نخل. حلل النص التالي واحتسب الأجرة اليومية الإجمالية للعامل الواحد حتى لو أُعطيت بسعر الساعة وعدد الساعات (مثال: 6 ساعات × 1.5 دينار = 9 دنانير للعامل).
 
@@ -62,29 +78,39 @@ async def parse_with_groq(text: str) -> dict:
 
 النص: "{text}"
     """
-    
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    
+
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "response_format": {"type": "json_object"}
     }
-    
+
     async with httpx.AsyncClient() as client:
         try:
-            res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20.0)
+            res = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=20.0
+            )
             if res.status_code == 200:
-                import json
                 result = res.json()
                 content = result['choices'][0]['message']['content']
+                logger.info(f"Groq raw response: {content}")
                 return json.loads(content)
+            else:
+                # هذا السطر هو الأهم — رح يطلعلنا سبب الفشل الحقيقي بالـ logs
+                logger.error(f"Groq API error {res.status_code}: {res.text}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Groq returned invalid JSON: {e}")
         except Exception as e:
-            print("Groq Error:", e)
+            logger.error(f"Groq request exception: {e}")
     return {}
 
 def generate_pdf_report():
@@ -93,7 +119,7 @@ def generate_pdf_report():
     cursor.execute("SELECT date, workers_count, wage_per_worker, expenses, notes FROM daily_records ORDER BY id DESC")
     rows = cursor.fetchall()
     conn.close()
-    
+
     table_rows = ""
     total_cost_all = 0
     for row in rows:
@@ -110,7 +136,7 @@ def generate_pdf_report():
             <td>{notes or '-'}</td>
         </tr>
         """
-        
+
     html_content = f"""
     <!DOCTYPE html>
     <html dir="rtl" lang="ar">
@@ -155,17 +181,17 @@ def generate_excel_report():
     cursor.execute("SELECT date, workers_count, wage_per_worker, expenses, notes FROM daily_records ORDER BY id DESC")
     rows = cursor.fetchall()
     conn.close()
-    
+
     wb = Workbook()
     ws = wb.active
     ws.title = "اليوميات"
-    
+
     ws.append(["التاريخ", "عدد العمال", "أجرة العامل", "المصاريف", "المجموع", "ملاحظات"])
     for row in rows:
         date, count, wage, exp, notes = row
         total = (count * wage) + exp
         ws.append([date, count, wage, exp, total, notes or ""])
-        
+
     output = BytesIO()
     wb.save(output)
     return output.getvalue()
@@ -175,15 +201,15 @@ async def telegram_webhook(request: Request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if TELEGRAM_WEBHOOK_SECRET and secret_header != TELEGRAM_WEBHOOK_SECRET:
         return Response(status_code=403)
-        
+
     data = await request.json()
     if "message" in data:
         chat_id = data["message"]["chat"]["id"]
         text = data["message"].get("text", "")
-        
+
         if text.startswith("/start"):
             await send_telegram_message(
-                chat_id, 
+                chat_id,
                 "أهلاً بك في بوت إدارة حسابات المزرعة!\nيمكنك كتابة اليوميات بأي طريقة (مثال: اشتغل 23 عامل 6 ساعات الساعة بدينار ونص، أو: 5 عمال اليومية 12 دينار)."
             )
         elif "pdf" in text.lower() or "تقرير" in text:
@@ -198,10 +224,10 @@ async def telegram_webhook(request: Request):
             wage = float(parsed.get("wage_per_worker", 0.0) or 0.0)
             exp = float(parsed.get("expenses", 0.0) or 0.0)
             notes = parsed.get("notes", "")
-            
+
             if w_count > 0 or wage > 0 or exp > 0:
                 today = datetime.now().strftime("%Y-%m-%d")
-                
+
                 conn = sqlite3.connect(DB_NAME)
                 cursor = conn.cursor()
                 cursor.execute(
@@ -210,12 +236,11 @@ async def telegram_webhook(request: Request):
                 )
                 conn.commit()
                 conn.close()
-                
+
                 total = (w_count * wage) + exp
                 response_msg = f"تم تسجيل اليومية بنجاح!\n- عدد العمال: {w_count}\n- أجرة العامل اليومية: {wage:.2f} د.أ\n- المصاريف: {exp:.2f} د.أ\n- المجموع الكلي: {total:.2f} د.أ"
                 await send_telegram_message(chat_id, response_msg)
             else:
                 await send_telegram_message(chat_id, "لم أتمكن من فهم البيانات. يرجى توضيح عدد العمال والأجرة أو طلب التقرير.")
-                
+
     return {"status": "ok"}
-    
