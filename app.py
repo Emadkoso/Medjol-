@@ -9,12 +9,10 @@ from weasyprint import HTML
 
 app = FastAPI()
 
-# المتغيرات البيئية
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
-# إعداد قاعدة البيانات
 DB_NAME = "harvest.db"
 
 def init_db():
@@ -52,11 +50,15 @@ async def parse_with_groq(text: str) -> dict:
         return {}
     
     prompt = f"""
-أنت مساعد مالي لمزرعة نخل مجدول. قم باستخراج البيانات التالية من النص وإرجاعها بتنسيق JSON فقط بدون أي نص آخر:
-- workers_count (عدد العمال كعدد صحيح)
-- wage_per_worker (أجرة العامل بالدينار كعدد)
-- expenses (المصاريف الإضافية كعدد)
-- notes (أي تفاصيل أو ملاحظات)
+أنت مساعد مالي ذكي لمزرعة نخل. حلل النص التالي واحتسب الأجرة اليومية الإجمالية للعامل الواحد حتى لو أُعطيت بسعر الساعة وعدد الساعات (مثال: 6 ساعات × 1.5 دينار = 9 دنانير للعامل).
+
+قم بإرجاع JSON حصراً بالصيغة التالية بدون أي كلام إضافي:
+{{
+  "workers_count": عدد العمال (عدد صحيح),
+  "wage_per_worker": إجمالي أجرة العامل الواحد لليوم بالدينار (عدد),
+  "expenses": المصاريف الإضافية (عدد),
+  "notes": "أي ملاحظات أو تفاصيل"
+}}
 
 النص: "{text}"
     """
@@ -81,8 +83,8 @@ async def parse_with_groq(text: str) -> dict:
                 result = res.json()
                 content = result['choices'][0]['message']['content']
                 return json.loads(content)
-        except Exception:
-            pass
+        except Exception as e:
+            print("Groq Error:", e)
     return {}
 
 def generate_pdf_report():
@@ -182,7 +184,7 @@ async def telegram_webhook(request: Request):
         if text.startswith("/start"):
             await send_telegram_message(
                 chat_id, 
-                "أهلاً بك في بوت إدارة حسابات المزرعة!\nيمكنك كتابة اليوميات بشكل طبيعي (مثال: اليوم اشتغل 5 عمال اليومية 12 دينار ومصاريف 10) أو اطلب 'تقرير PDF' أو 'تقرير اكسل'."
+                "أهلاً بك في بوت إدارة حسابات المزرعة!\nيمكنك كتابة اليوميات بأي طريقة (مثال: اشتغل 23 عامل 6 ساعات الساعة بدينار ونص، أو: 5 عمال اليومية 12 دينار)."
             )
         elif "pdf" in text.lower() or "تقرير" in text:
             pdf_data = generate_pdf_report()
@@ -192,12 +194,13 @@ async def telegram_webhook(request: Request):
             await send_telegram_document(chat_id, "report.xlsx", excel_data, "إليك تقرير الحسابات بصيغة Excel")
         else:
             parsed = await parse_with_groq(text)
-            if parsed and (parsed.get("workers_count") or parsed.get("expenses")):
+            w_count = parsed.get("workers_count", 0) or 0
+            wage = float(parsed.get("wage_per_worker", 0.0) or 0.0)
+            exp = float(parsed.get("expenses", 0.0) or 0.0)
+            notes = parsed.get("notes", "")
+            
+            if w_count > 0 or wage > 0 or exp > 0:
                 today = datetime.now().strftime("%Y-%m-%d")
-                w_count = parsed.get("workers_count", 0) or 0
-                wage = parsed.get("wage_per_worker", 0.0) or 0.0
-                exp = parsed.get("expenses", 0.0) or 0.0
-                notes = parsed.get("notes", "")
                 
                 conn = sqlite3.connect(DB_NAME)
                 cursor = conn.cursor()
@@ -209,7 +212,7 @@ async def telegram_webhook(request: Request):
                 conn.close()
                 
                 total = (w_count * wage) + exp
-                response_msg = f"تم تسجيل اليومية بنجاح!\n- عدد العمال: {w_count}\n- اليومية: {wage} د.أ\n- المصاريف: {exp} د.أ\n- المجموع: {total} د.أ"
+                response_msg = f"تم تسجيل اليومية بنجاح!\n- عدد العمال: {w_count}\n- أجرة العامل اليومية: {wage:.2f} د.أ\n- المصاريف: {exp:.2f} د.أ\n- المجموع الكلي: {total:.2f} د.أ"
                 await send_telegram_message(chat_id, response_msg)
             else:
                 await send_telegram_message(chat_id, "لم أتمكن من فهم البيانات. يرجى توضيح عدد العمال والأجرة أو طلب التقرير.")
