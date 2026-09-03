@@ -1,4 +1,4 @@
-# app.py - النسخة النهائية مع إصلاح step المكرر
+# app.py – بوت مشرف العمال (نسخة ذكية ومبسطة)
 
 import os
 import re
@@ -22,41 +22,38 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
 PORT = int(os.getenv("PORT", 8000))
-DB_NAME = "harvest.db"
+DB_NAME = "farm.db"
 
 # ========== قاعدة البيانات ==========
 def init_db():
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_records (
+    c = conn.cursor()
+    # جدول اليوميات
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS daily_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
+            date TEXT UNIQUE,
             workers_count INTEGER,
-            wage_per_worker REAL,
+            workers_names TEXT,
+            total_hours REAL,
             expenses REAL,
-            notes TEXT
+            notes TEXT,
+            created_at TEXT
         )
     ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS conversation_state (
+    # جدول الحالة (للحوار)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS session (
             chat_id INTEGER PRIMARY KEY,
             step TEXT,
-            date TEXT,
-            workers_count INTEGER,
-            wage_mode TEXT,
-            hours REAL,
-            wage_per_hour REAL,
-            wage_per_worker REAL,
-            expenses REAL,
-            notes TEXT
+            data TEXT  -- JSON
         )
     ''')
     conn.commit()
     conn.close()
 init_db()
 
-# ========== إرسال رسائل تلغرام ==========
+# ========== إرسال رسائل ==========
 async def send_telegram_message(chat_id: int, text: str):
     if not TELEGRAM_BOT_TOKEN:
         return
@@ -79,522 +76,391 @@ async def send_telegram_document(chat_id: int, filename: str, content: bytes, ca
         except Exception as e:
             logger.error(f"doc error: {e}")
 
-# ========== استخراج الأرقام ==========
-ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-ARABIC_NUMBER_WORDS = {
-    "صفر": 0, "واحد": 1, "وحدة": 1, "اثنين": 2, "اثنان": 2,
-    "تلاتة": 3, "ثلاثة": 3, "اربعة": 4, "أربعة": 4, "خمسة": 5,
-    "ستة": 6, "سبعة": 7, "ثمانية": 8, "تمانية": 8, "تسعة": 9, "عشرة": 10,
-    "احدعش": 11, "أحد عشر": 11, "اثناعش": 12, "اثنا عشر": 12,
-    "تلتطعش": 13, "ثلاثطعش": 13, "اربعطعش": 14, "خمسطعش": 15,
-    "سطعش": 16, "ستطعش": 16, "سبعطعش": 17, "تمنطعش": 18, "تسعطعش": 19,
-    "عشرين": 20, "تلاتين": 30, "ثلاثين": 30, "اربعين": 40, "خمسين": 50,
-    "ستين": 60, "سبعين": 70, "تمانين": 80, "تسعين": 90, "مية": 100, "مائة": 100
-}
-
+# ========== استخراج الأرقام والنصوص ==========
 def extract_number(text: str):
-    t = text.strip().translate(ARABIC_INDIC_DIGITS)
-    match = re.search(r"\d+(\.\d+)?", t)
+    match = re.search(r"\d+(\.\d+)?", text)
     if match:
         return float(match.group())
-    for word, val in ARABIC_NUMBER_WORDS.items():
-        if word in text:
-            return float(val)
     return None
 
-async def extract_number_ai(text: str):
+def extract_names(text: str):
+    # استخراج الأسماء (كلمات بعد كلمة "اسم" أو "أسماؤهم" أو "هم")
+    # بسيط: نأخذ كل الكلمات التي ليست أرقاماً
+    words = re.findall(r"[^\d\s]+", text)
+    # نفلتر الكلمات التي قد تكون أسماء (طولها > 2)
+    names = [w for w in words if len(w) > 2 and not w.isdigit()]
+    return names if names else None
+
+# ========== الذكاء الاصطناعي لاستخراج البيانات ==========
+async def extract_data_with_ai(text: str):
     if not OPENROUTER_API_KEY:
         return None
-    prompt = (
-        "استخرج رقماً واحداً فقط من النص التالي وأرجعه بصيغة JSON: "
-        '{"number": <رقم أو null>}\n'
-        f'النص: "{text}"'
-    )
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://medjol.onrender.com",
-        "X-Title": "Medjol Farm Bot"
-    }
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"}
-    }
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers, json=payload, timeout=15
-            )
-            if res.status_code == 200:
-                data = res.json()
-                content = data['choices'][0]['message']['content']
-                return json.loads(content).get("number")
-        except:
-            pass
-    return None
+    prompt = f"""
+أنت مساعد ذكي لمشرف عمال في مزرعة. استخرج من النص التالي:
+- عدد العمال (عدد)
+- أسماء العمال (قائمة أسماء مفصولة بفواصل)
+- عدد ساعات العمل (رقم)
+- المصاريف (رقم)
+- أي ملاحظات إضافية
 
-# ========== تحليل النية ==========
-def build_prompt(text: str, today: str, yesterday: str, day_before: str):
-    return f"""أنت محاسب خبير لمزرعة نخيل في الأردن. حدد نية المستخدم.
+أخرج JSON بهذا الشكل:
+{{
+  "workers_count": عدد أو null,
+  "workers_names": "قائمة الأسماء" أو null,
+  "total_hours": رقم أو null,
+  "expenses": رقم أو null,
+  "notes": "نص" أو null
+}}
 
-الأوامر:
-- "record": تسجيل يومية.
-- "update": تعديل سجل.
-- "report": تقرير.
-- "other": أي شيء آخر.
-
-استخرج البيانات المذكورة فقط:
-- workers_count, hours, wage_per_hour, wage_per_worker, expenses, date (YYYY-MM-DD)
-- للتحديث: update_target_date ("last" أو تاريخ), update_action, update_value, update_note
-- للتقرير: report_scope ("single_day"/"range"/"all"), report_date_from, report_date_to, report_format ("text"/"pdf"/"excel")
-
-أخرج JSON فقط بدون نص إضافي.
-
-التاريخ: اليوم {today}، امس {yesterday}، اول امس {day_before}.
 النص: "{text}"
 """
-
-async def analyze_message(text: str) -> dict:
-    if not OPENROUTER_API_KEY:
-        return {"intent": "other"}
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    day_before = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
-    prompt = build_prompt(text, today, yesterday, day_before)
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://medjol.onrender.com",
-        "X-Title": "Medjol Farm Bot"
+        "X-Title": "Medjol Bot"
     }
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
+        "temperature": 0.2,
         "response_format": {"type": "json_object"}
     }
     async with httpx.AsyncClient() as client:
         try:
             res = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers, json=payload, timeout=25
+                headers=headers, json=payload, timeout=20
             )
             if res.status_code == 200:
                 content = res.json()['choices'][0]['message']['content']
                 return json.loads(content)
-        except:
-            pass
-    return {"intent": "other"}
+        except Exception as e:
+            logger.error(f"AI error: {e}")
+    return None
 
-# ========== دوال الحالة والحوار ==========
-def get_state(chat_id: int):
+# ========== دوال الجلسة (الحوار) ==========
+def get_session(chat_id: int):
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM conversation_state WHERE chat_id = ?", (chat_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute("SELECT step, data FROM session WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
     conn.close()
-    if not row:
-        return None
-    cols = ["chat_id", "step", "date", "workers_count", "wage_mode",
-            "hours", "wage_per_hour", "wage_per_worker", "expenses", "notes"]
-    return dict(zip(cols, row))
+    if row:
+        return {"step": row[0], "data": json.loads(row[1])}
+    return None
 
-def save_state(chat_id: int, **fields):
-    existing = get_state(chat_id)
+def save_session(chat_id: int, step: str, data: dict):
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    if existing:
-        merged = {**existing, **fields}
-        cursor.execute('''
-            UPDATE conversation_state SET step=?, date=?, workers_count=?, wage_mode=?,
-                hours=?, wage_per_hour=?, wage_per_worker=?, expenses=?, notes=?
-            WHERE chat_id=?
-        ''', (merged["step"], merged["date"], merged["workers_count"], merged["wage_mode"],
-              merged["hours"], merged["wage_per_hour"], merged["wage_per_worker"],
-              merged["expenses"], merged["notes"], chat_id))
-    else:
-        defaults = {
-            "step": None, "date": datetime.now().strftime("%Y-%m-%d"),
-            "workers_count": None, "wage_mode": None, "hours": None,
-            "wage_per_hour": None, "wage_per_worker": None, "expenses": None, "notes": ""
+    c = conn.cursor()
+    c.execute("REPLACE INTO session (chat_id, step, data) VALUES (?, ?, ?)",
+              (chat_id, step, json.dumps(data)))
+    conn.commit()
+    conn.close()
+
+def clear_session(chat_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM session WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+# ========== دوال اليوميات ==========
+def save_daily_log(date, workers_count, workers_names, total_hours, expenses, notes):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO daily_logs
+        (date, workers_count, workers_names, total_hours, expenses, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (date, workers_count, workers_names, total_hours, expenses, notes, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_daily_log(date: str):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT * FROM daily_logs WHERE date = ?", (date,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "date": row[1],
+            "workers_count": row[2],
+            "workers_names": row[3],
+            "total_hours": row[4],
+            "expenses": row[5],
+            "notes": row[6]
         }
-        merged = {**defaults, **fields}
-        cursor.execute('''
-            INSERT INTO conversation_state
-            (chat_id, step, date, workers_count, wage_mode, hours, wage_per_hour, wage_per_worker, expenses, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, merged["step"], merged["date"], merged["workers_count"], merged["wage_mode"],
-              merged["hours"], merged["wage_per_hour"], merged["wage_per_worker"],
-              merged["expenses"], merged["notes"]))
-    conn.commit()
-    conn.close()
+    return None
 
-def clear_state(chat_id: int):
+def get_all_logs(date_from=None, date_to=None):
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM conversation_state WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-def next_missing_step(state: dict) -> str:
-    if not state.get("workers_count"):
-        return "ASK_WORKERS"
-    if not state.get("wage_per_worker"):
-        if not state.get("wage_mode"):
-            return "ASK_WAGE_MODE"
-        if state["wage_mode"] == "hourly":
-            if not state.get("hours"):
-                return "ASK_HOURS"
-            if not state.get("wage_per_hour"):
-                return "ASK_WAGE_PER_HOUR"
-        else:
-            return "ASK_WAGE_DAILY"
-    if state.get("expenses") is None:
-        return "ASK_EXPENSES"
-    return "CONFIRM"
-
-def question_for_step(step: str) -> str:
-    return {
-        "ASK_WORKERS": "🧑‍🌾 كم عدد العمال؟",
-        "ASK_WAGE_MODE": "💵 كيف تحدد الأجرة؟\n1️⃣ يومية\n2️⃣ بالساعة\nاكتب 1 أو 2.",
-        "ASK_HOURS": "⏱️ كم ساعة عمل؟",
-        "ASK_WAGE_PER_HOUR": "💰 كم أجرة الساعة؟",
-        "ASK_WAGE_DAILY": "💰 كم أجرة العامل اليومية؟",
-        "ASK_EXPENSES": "🧾 المصاريف الإضافية؟\nاكتب الرقم أو 'لا'.",
-    }.get(step, "")
-
-def build_confirmation_text(state: dict) -> str:
-    wage = state.get("wage_per_worker") or 0
-    workers = state.get("workers_count") or 0
-    expenses = state.get("expenses") or 0
-    total = (workers * wage) + expenses
-    return (
-        f"📋 راجع البيانات ({state.get('date')}):\n"
-        f"- عمال: {workers}\n- أجرة/عامل: {wage:.2f} د.أ\n- مصاريف: {expenses:.2f} د.أ\n"
-        f"- المجموع: {total:.2f} د.أ\n\n✅ اكتب 'نعم' للحفظ أو 'الغاء' للإلغاء."
-    )
-
-NO_EXPENSE_WORDS = ["لا", "ﻻ", "لا يوجد", "ماكو", "بدون", "no", "0"]
-YES_WORDS = ["نعم", "ايوه", "ايه", "تمام", "صح", "اوك", "ok", "yes", "احفظ", "أكيد"]
-CANCEL_WORDS = ["الغاء", "إلغاء", "كنسل", "cancel", "لغي", "الغي"]
-
-async def handle_guided_answer(chat_id: int, text: str, state: dict):
-    step = state["step"]
-    stripped = text.strip()
-    if step == "ASK_WORKERS":
-        num = extract_number(stripped) or await extract_number_ai(stripped)
-        if num is None:
-            await send_telegram_message(chat_id, "لم أفهم الرقم، حاول مرة أخرى.")
-            return
-        state["workers_count"] = int(num)
-    elif step == "ASK_WAGE_MODE":
-        if "2" in stripped or "ساعة" in stripped:
-            state["wage_mode"] = "hourly"
-        elif "1" in stripped or "يومي" in stripped or "مباشر" in stripped:
-            state["wage_mode"] = "daily"
-        else:
-            await send_telegram_message(chat_id, "اكتب 1 أو 2.")
-            return
-    elif step == "ASK_HOURS":
-        num = extract_number(stripped) or await extract_number_ai(stripped)
-        if num is None:
-            await send_telegram_message(chat_id, "لم أفهم، كم ساعة؟")
-            return
-        state["hours"] = num
-    elif step == "ASK_WAGE_PER_HOUR":
-        num = extract_number(stripped) or await extract_number_ai(stripped)
-        if num is None:
-            await send_telegram_message(chat_id, "لم أفهم، كم أجرة الساعة؟")
-            return
-        state["wage_per_hour"] = num
-        state["wage_per_worker"] = (state.get("hours") or 0) * num
-        state["notes"] = (state.get("notes") or "") + f" {state['hours']}س×{num}د"
-    elif step == "ASK_WAGE_DAILY":
-        num = extract_number(stripped) or await extract_number_ai(stripped)
-        if num is None:
-            await send_telegram_message(chat_id, "لم أفهم، كم أجرة العامل؟")
-            return
-        state["wage_per_worker"] = num
-    elif step == "ASK_EXPENSES":
-        if any(w in stripped for w in NO_EXPENSE_WORDS) and extract_number(stripped) is None:
-            state["expenses"] = 0.0
-        else:
-            num = extract_number(stripped) or await extract_number_ai(stripped)
-            if num is None:
-                await send_telegram_message(chat_id, "لم أفهم، اكتب رقماً أو 'لا'.")
-                return
-            state["expenses"] = num
-    elif step == "CONFIRM":
-        if any(w in stripped for w in YES_WORDS):
-            workers = state.get("workers_count") or 0
-            wage = state.get("wage_per_worker") or 0
-            expenses = state.get("expenses") or 0
-            notes = (state.get("notes") or "").strip()
-            record_date = state.get("date") or datetime.now().strftime("%Y-%m-%d")
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO daily_records (date, workers_count, wage_per_worker, expenses, notes) VALUES (?, ?, ?, ?, ?)",
-                (record_date, workers, wage, expenses, notes)
-            )
-            conn.commit()
-            conn.close()
-            clear_state(chat_id)
-            total = (workers * wage) + expenses
-            await send_telegram_message(chat_id,
-                f"✅ تم حفظ اليومية ({record_date})\nعمال: {workers}\nأجرة: {wage:.2f}\nمصاريف: {expenses:.2f}\nالمجموع: {total:.2f}")
-        elif any(w in stripped for w in CANCEL_WORDS):
-            clear_state(chat_id)
-            await send_telegram_message(chat_id, "❌ تم الإلغاء.")
-        else:
-            await send_telegram_message(chat_id, "اكتب 'نعم' أو 'الغاء'.")
-        return
-
-    # ========== التصحيح هنا ==========
-    # نضبط step داخل state ثم نمرر state كله
-    step_after = next_missing_step(state)
-    state['step'] = step_after
-    save_state(chat_id, **state)
-
-    if step_after == "CONFIRM":
-        await send_telegram_message(chat_id, build_confirmation_text(state))
-    else:
-        await send_telegram_message(chat_id, question_for_step(step_after))
-
-async def start_guided_flow(chat_id: int, prefill: dict):
-    workers = int(prefill.get("workers_count") or 0) or None
-    hours = prefill.get("hours") or None
-    wage_per_hour = prefill.get("wage_per_hour") or None
-    wage_per_worker = prefill.get("wage_per_worker") or None
-    expenses = prefill.get("expenses")
-    date_val = prefill.get("date") or datetime.now().strftime("%Y-%m-%d")
-    wage_mode = None
-    if wage_per_worker:
-        wage_mode = "daily"
-    elif hours and wage_per_hour:
-        wage_per_worker = hours * wage_per_hour
-        wage_mode = "hourly"
-    state = {
-        "date": date_val, "workers_count": workers, "wage_mode": wage_mode,
-        "hours": hours, "wage_per_hour": wage_per_hour,
-        "wage_per_worker": wage_per_worker,
-        "expenses": expenses if expenses not in (None, 0) else (0.0 if expenses == 0 else None),
-        "notes": ""
-    }
-    step = next_missing_step(state)
-    state['step'] = step
-    save_state(chat_id, **state)
-    if step == "CONFIRM":
-        await send_telegram_message(chat_id, build_confirmation_text(state))
-    else:
-        intro = "تمام، خلينا نكمل 👇\n\n" if workers or wage_per_worker else ""
-        await send_telegram_message(chat_id, intro + question_for_step(step))
-
-# ========== دوال التحديث والتقارير ==========
-def query_records(date_from=None, date_to=None):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    c = conn.cursor()
     if date_from and date_to:
-        cursor.execute(
-            "SELECT date, workers_count, wage_per_worker, expenses, notes FROM daily_records WHERE date BETWEEN ? AND ? ORDER BY date ASC",
-            (date_from, date_to)
-        )
+        c.execute("SELECT * FROM daily_logs WHERE date BETWEEN ? AND ? ORDER BY date", (date_from, date_to))
     else:
-        cursor.execute("SELECT date, workers_count, wage_per_worker, expenses, notes FROM daily_records ORDER BY date ASC")
-    rows = cursor.fetchall()
+        c.execute("SELECT * FROM daily_logs ORDER BY date")
+    rows = c.fetchall()
     conn.close()
     return rows
 
-def format_text_report(rows, title):
+# ========== توليد التقارير ==========
+def generate_text_report(rows):
     if not rows:
-        return f"{title}\n\nلا توجد سجلات."
-    lines = [title, ""]
-    grand = 0.0
-    for date, count, wage, exp, notes in rows:
-        total = (count * wage) + exp
-        grand += total
-        lines.append(f"📅 {date} | عمال: {count} | أجرة: {wage:.2f} | مصاريف: {exp:.2f} | المجموع: {total:.2f}")
+        return "لا توجد بيانات."
+    lines = ["📋 تقرير اليوميات", "="*30]
+    grand_total = 0.0
+    for row in rows:
+        date, workers_count, workers_names, hours, expenses, notes = row[1], row[2], row[3], row[4], row[5], row[6]
+        total_wages = (workers_count or 0) * (hours or 0) * 5  # افترض 5 دنانير للساعة (يمكن تعديله)
+        total = total_wages + (expenses or 0)
+        grand_total += total
+        lines.append(f"\n📅 {date}")
+        lines.append(f"   عدد العمال: {workers_count or 0}")
+        if workers_names:
+            lines.append(f"   الأسماء: {workers_names}")
+        lines.append(f"   ساعات العمل: {hours or 0}")
+        lines.append(f"   المصاريف: {expenses or 0:.2f} د.أ")
+        lines.append(f"   الإجمالي: {total:.2f} د.أ")
         if notes:
             lines.append(f"   ملاحظات: {notes}")
-    lines.append("")
-    lines.append(f"🏆 الإجمالي الكلي: {grand:.2f} د.أ")
+    lines.append("\n" + "="*30)
+    lines.append(f"🏆 الإجمالي الكلي: {grand_total:.2f} د.أ")
     return "\n".join(lines)
 
 def generate_excel_report(rows):
     wb = Workbook()
     ws = wb.active
-    ws.title = "تقرير"
-    headers = ["التاريخ", "عدد العمال", "أجرة العامل", "المصاريف", "المجموع", "ملاحظات"]
+    ws.title = "اليوميات"
+    headers = ["التاريخ", "عدد العمال", "أسماء العمال", "ساعات العمل", "المصاريف", "الملاحظات", "الإجمالي"]
     ws.append(headers)
-    for date, count, wage, exp, notes in rows:
-        total = (count * wage) + exp
-        ws.append([date, count, wage, exp, total, notes])
+    for row in rows:
+        date, workers_count, names, hours, expenses, notes = row[1], row[2], row[3], row[4], row[5], row[6]
+        total = (workers_count or 0) * (hours or 0) * 5 + (expenses or 0)
+        ws.append([date, workers_count, names, hours, expenses, notes, total])
     wb.save("temp.xlsx")
     with open("temp.xlsx", "rb") as f:
         data = f.read()
     os.remove("temp.xlsx")
     return data
 
-def generate_pdf_report(rows, title):
-    html = f"""
+def generate_pdf_report(rows):
+    html = """
     <html><head><meta charset="UTF-8"><style>
-    body {{ font-family: Arial; direction: rtl; }}
-    h1 {{ color: #2c3e50; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-    th, td {{ border: 1px solid #ccc; padding: 8px; text-align: center; }}
-    th {{ background-color: #f2f2f2; }}
+    body { font-family: Arial; direction: rtl; }
+    h1 { color: #2c3e50; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+    th { background-color: #f2f2f2; }
     </style></head><body>
-    <h1>{title}</h1>
-    <table><tr><th>التاريخ</th><th>العمال</th><th>أجرة العامل</th><th>المصاريف</th><th>المجموع</th><th>ملاحظات</th></tr>
+    <h1>تقرير اليوميات</h1>
+    <table><tr><th>التاريخ</th><th>العمال</th><th>الأسماء</th><th>الساعات</th><th>المصاريف</th><th>الملاحظات</th><th>الإجمالي</th></tr>
     """
     grand = 0.0
-    for date, count, wage, exp, notes in rows:
-        total = (count * wage) + exp
+    for row in rows:
+        date, workers_count, names, hours, expenses, notes = row[1], row[2], row[3], row[4], row[5], row[6]
+        total = (workers_count or 0) * (hours or 0) * 5 + (expenses or 0)
         grand += total
-        html += f"<tr><td>{date}</td><td>{count}</td><td>{wage:.2f}</td><td>{exp:.2f}</td><td>{total:.2f}</td><td>{notes or ''}</td></tr>"
+        html += f"<tr><td>{date}</td><td>{workers_count or 0}</td><td>{names or ''}</td><td>{hours or 0}</td><td>{expenses or 0:.2f}</td><td>{notes or ''}</td><td>{total:.2f}</td></tr>"
     html += f"</table><p style='font-weight:bold;'>الإجمالي الكلي: {grand:.2f} د.أ</p></body></html>"
     return HTML(string=html).write_pdf()
 
-async def handle_update(chat_id: int, update_data: dict):
-    target = update_data.get("update_target_date")
-    action = update_data.get("update_action")
-    value = update_data.get("update_value")
-    note = update_data.get("update_note", "")
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    if target == "last":
-        cursor.execute("SELECT id, date, workers_count, wage_per_worker, expenses, notes FROM daily_records ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        if not row:
-            await send_telegram_message(chat_id, "لا يوجد سجلات.")
-            conn.close()
-            return
-        record_id, old_date, old_workers, old_wage, old_exp, old_notes = row
-        current = {"date": old_date, "workers": old_workers, "wage": old_wage, "expenses": old_exp, "notes": old_notes}
-    else:
-        cursor.execute("SELECT id, date, workers_count, wage_per_worker, expenses, notes FROM daily_records WHERE date = ?", (target,))
-        row = cursor.fetchone()
-        if not row:
-            await send_telegram_message(chat_id, f"لا يوجد سجل بتاريخ {target}.")
-            conn.close()
-            return
-        record_id, old_date, old_workers, old_wage, old_exp, old_notes = row
-        current = {"date": old_date, "workers": old_workers, "wage": old_wage, "expenses": old_exp, "notes": old_notes}
-
-    new_exp = current["expenses"]
-    new_wage = current["wage"]
-    new_workers = current["workers"]
-    new_notes = current["notes"] or ""
-    if action == "add_expense":
-        new_exp += value
-        new_notes += f" إضافة مصاريف {value:.2f}."
-    elif action == "add_expense_per_worker":
-        new_exp += value * current["workers"]
-        new_notes += f" إضافة مصاريف لكل عامل {value:.2f}."
-    elif action == "set_expense":
-        new_exp = value
-        new_notes += f" تعديل المصاريف إلى {value:.2f}."
-    elif action == "set_wage":
-        new_wage = value
-        new_notes += f" تعديل الأجرة إلى {value:.2f}."
-    elif action == "set_workers":
-        new_workers = int(value)
-        new_notes += f" تعديل العمال إلى {int(value)}."
-    elif action == "delete_record":
-        cursor.execute("DELETE FROM daily_records WHERE id = ?", (record_id,))
-        conn.commit()
-        conn.close()
-        await send_telegram_message(chat_id, f"🗑️ تم حذف سجل {current['date']}.")
-        return
-    elif action == "append_note":
-        new_notes += f" {note}"
-    else:
-        await send_telegram_message(chat_id, "عملية غير معروفة.")
-        conn.close()
-        return
-    cursor.execute(
-        "UPDATE daily_records SET workers_count=?, wage_per_worker=?, expenses=?, notes=? WHERE id=?",
-        (new_workers, new_wage, new_exp, new_notes.strip(), record_id)
-    )
-    conn.commit()
-    conn.close()
-    await send_telegram_message(chat_id, f"✅ تم تحديث سجل {current['date']}.")
-
-async def handle_report(chat_id: int, report_data: dict):
-    scope = report_data.get("report_scope", "all")
-    fmt = report_data.get("report_format", "text")
-    date_from = report_data.get("report_date_from")
-    date_to = report_data.get("report_date_to")
-    if scope == "single_day":
-        date_from = date_to = date_from or date_to
-    elif scope == "all":
-        date_from = date_to = None
-    rows = query_records(date_from, date_to)
-    if not rows:
-        await send_telegram_message(chat_id, "لا توجد بيانات.")
-        return
-    if fmt == "text":
-        title = f"تقرير المزرعة ({date_from or 'الكل'} - {date_to or 'الكل'})"
-        await send_telegram_message(chat_id, format_text_report(rows, title))
-    elif fmt == "excel":
-        data = generate_excel_report(rows)
-        await send_telegram_document(chat_id, "تقرير.xlsx", data, "تقرير Excel")
-    elif fmt == "pdf":
-        title = f"تقرير المزرعة ({date_from or 'الكل'} - {date_to or 'الكل'})"
-        pdf = generate_pdf_report(rows, title)
-        await send_telegram_document(chat_id, "تقرير.pdf", pdf, title)
-    else:
-        await send_telegram_message(chat_id, "صيغة غير مدعومة.")
-
-# ========== المعالج الرئيسي ==========
+# ========== المعالج الرئيسي (ذكي) ==========
 async def handle_incoming_message(chat_id: int, text: str):
-    await send_telegram_message(chat_id, "⏳ جارٍ المعالجة...")
-    try:
-        state = get_state(chat_id)
-        if state and state.get("step") not in [None, "CONFIRM"]:
-            await handle_guided_answer(chat_id, text, state)
-            return
-        analysis = await analyze_message(text)
-        intent = analysis.get("intent", "other")
-        if intent == "record":
-            await start_guided_flow(chat_id, analysis)
-        elif intent == "update":
-            await handle_update(chat_id, analysis)
-        elif intent == "report":
-            await handle_report(chat_id, analysis)
-        else:
-            await send_telegram_message(chat_id,
-                "مرحباً! أرسل تفاصيل اليومية (مثل: 5 عمال، 10 دنانير)، أو اطلب تقريراً، أو تحديثاً.")
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await send_telegram_message(chat_id, "❌ حدث خطأ، حاول لاحقاً.")
+    # أولاً: نرسل تأكيد استلام
+    await send_telegram_message(chat_id, "⏳ جارٍ معالجة طلبك...")
 
-# ========== حلقة Polling مع حذف webhook ==========
+    # نتحقق من وجود جلسة نشطة
+    session = get_session(chat_id)
+    if session:
+        step = session["step"]
+        data = session["data"]
+
+        if step == "AWAITING_CONFIRMATION":
+            if "نعم" in text or "تأكيد" in text or "حفظ" in text:
+                # حفظ اليومية
+                save_daily_log(
+                    date=data["date"],
+                    workers_count=data.get("workers_count"),
+                    workers_names=data.get("workers_names"),
+                    total_hours=data.get("total_hours"),
+                    expenses=data.get("expenses"),
+                    notes=data.get("notes")
+                )
+                clear_session(chat_id)
+                await send_telegram_message(chat_id, "✅ تم حفظ اليومية بنجاح!")
+                # نعرض ملخص
+                log = get_daily_log(data["date"])
+                if log:
+                    msg = f"📋 ملخص اليوم ({log['date']}):\n"
+                    msg += f"عدد العمال: {log['workers_count'] or 0}\n"
+                    if log['workers_names']:
+                        msg += f"الأسماء: {log['workers_names']}\n"
+                    msg += f"ساعات العمل: {log['total_hours'] or 0}\n"
+                    msg += f"المصاريف: {log['expenses'] or 0:.2f} د.أ\n"
+                    total = (log['workers_count'] or 0) * (log['total_hours'] or 0) * 5 + (log['expenses'] or 0)
+                    msg += f"الإجمالي: {total:.2f} د.أ"
+                    await send_telegram_message(chat_id, msg)
+            elif "الغاء" in text or "إلغاء" in text:
+                clear_session(chat_id)
+                await send_telegram_message(chat_id, "❌ تم إلغاء العملية.")
+            else:
+                await send_telegram_message(chat_id, "أكتب 'نعم' للتأكيد والحفظ، أو 'الغاء' للإلغاء.")
+            return
+
+        elif step == "AWAITING_NAMES":
+            names = extract_names(text)
+            if not names:
+                await send_telegram_message(chat_id, "لم أفهم الأسماء، حاول كتابتها مفصولة بفواصل (مثل: أحمد، محمد، خالد).")
+                return
+            data["workers_names"] = ", ".join(names)
+            data["workers_count"] = len(names)  # تحديث العدد تلقائياً
+            # ننتقل للسؤال عن الساعات
+            data["step"] = "ASK_HOURS"
+            save_session(chat_id, "ASK_HOURS", data)
+            await send_telegram_message(chat_id, f"✅ تم تسجيل {len(names)} عاملاً. كم عدد ساعات العمل اليوم؟")
+            return
+
+        elif step == "ASK_HOURS":
+            num = extract_number(text)
+            if num is None:
+                await send_telegram_message(chat_id, "لم أفهم، كم ساعة؟ (اكتب رقماً)")
+                return
+            data["total_hours"] = num
+            data["step"] = "ASK_EXPENSES"
+            save_session(chat_id, "ASK_EXPENSES", data)
+            await send_telegram_message(chat_id, f"✅ ساعات العمل: {num} ساعة. كم المصاريف الإضافية (نقل، أكل، مواد)؟ (اكتب رقماً أو 'لا')")
+            return
+
+        elif step == "ASK_EXPENSES":
+            if "لا" in text or "ما في" in text or "0" in text:
+                data["expenses"] = 0.0
+            else:
+                num = extract_number(text)
+                if num is None:
+                    await send_telegram_message(chat_id, "لم أفهم، اكتب رقم المصاريف أو 'لا'.")
+                    return
+                data["expenses"] = num
+            # سؤال عن ملاحظات
+            data["step"] = "ASK_NOTES"
+            save_session(chat_id, "ASK_NOTES", data)
+            await send_telegram_message(chat_id, "📝 هل تريد إضافة ملاحظات؟ (اكتبها، أو اكتب 'لا')")
+            return
+
+        elif step == "ASK_NOTES":
+            if "لا" not in text:
+                data["notes"] = text
+            else:
+                data["notes"] = ""
+            # عرض ملخص للتأكيد
+            date = data["date"]
+            workers_count = data.get("workers_count", 0)
+            workers_names = data.get("workers_names", "")
+            hours = data.get("total_hours", 0)
+            expenses = data.get("expenses", 0)
+            total = workers_count * hours * 5 + expenses
+            msg = f"📋 راجع بيانات اليوم ({date}):\n"
+            msg += f"عدد العمال: {workers_count}\n"
+            if workers_names:
+                msg += f"الأسماء: {workers_names}\n"
+            msg += f"ساعات العمل: {hours}\n"
+            msg += f"المصاريف: {expenses:.2f} د.أ\n"
+            msg += f"الإجمالي: {total:.2f} د.أ\n"
+            if data.get("notes"):
+                msg += f"ملاحظات: {data['notes']}\n"
+            msg += "\n✅ هل تريد حفظ هذه البيانات؟ (نعم / الغاء)"
+            data["step"] = "AWAITING_CONFIRMATION"
+            save_session(chat_id, "AWAITING_CONFIRMATION", data)
+            await send_telegram_message(chat_id, msg)
+            return
+
+    # لا جلسة نشطة: نحلل الرسالة بالذكاء الاصطناعي
+    ai_data = await extract_data_with_ai(text)
+    if ai_data and (ai_data.get("workers_count") or ai_data.get("workers_names")):
+        # استخرجنا بيانات مفيدة
+        today = datetime.now().strftime("%Y-%m-%d")
+        data = {
+            "date": today,
+            "workers_count": ai_data.get("workers_count"),
+            "workers_names": ai_data.get("workers_names"),
+            "total_hours": ai_data.get("total_hours"),
+            "expenses": ai_data.get("expenses"),
+            "notes": ai_data.get("notes") or ""
+        }
+        # نتحقق من المفقودات
+        if not data["workers_names"] and data["workers_count"]:
+            # نطلب الأسماء
+            save_session(chat_id, "AWAITING_NAMES", data)
+            await send_telegram_message(chat_id, f"عدد العمال: {data['workers_count']}. الرجاء كتابة أسمائهم مفصولة بفواصل.")
+            return
+        elif not data["workers_count"] and not data["workers_names"]:
+            # ما فيه بيانات كافية
+            await send_telegram_message(chat_id, "لم أفهم بيانات اليوم، هل يمكنك إعادة صياغتها؟ (مثال: 5 عمال: أحمد، محمد، ساعة 8، مصاريف 10 دنانير)")
+            return
+        else:
+            # اكتمل كل شيء تقريباً
+            if not data["total_hours"]:
+                save_session(chat_id, "ASK_HOURS", data)
+                await send_telegram_message(chat_id, f"✅ تم التعرف على {data['workers_count'] or len(data['workers_names'].split(','))} عاملاً. كم عدد ساعات العمل اليوم؟")
+                return
+            if data["expenses"] is None:
+                save_session(chat_id, "ASK_EXPENSES", data)
+                await send_telegram_message(chat_id, f"✅ ساعات العمل: {data['total_hours']} ساعة. كم المصاريف الإضافية؟")
+                return
+            # كل البيانات موجودة، نعرض للتأكيد
+            data["step"] = "AWAITING_CONFIRMATION"
+            workers_count = data["workers_count"] or len(data["workers_names"].split(","))
+            total = workers_count * (data["total_hours"] or 0) * 5 + (data["expenses"] or 0)
+            msg = f"📋 بيانات اليوم ({data['date']}):\n"
+            msg += f"عدد العمال: {workers_count}\n"
+            if data["workers_names"]:
+                msg += f"الأسماء: {data['workers_names']}\n"
+            msg += f"ساعات العمل: {data['total_hours'] or 0}\n"
+            msg += f"المصاريف: {data['expenses'] or 0:.2f} د.أ\n"
+            msg += f"الإجمالي: {total:.2f} د.أ\n"
+            if data["notes"]:
+                msg += f"ملاحظات: {data['notes']}\n"
+            msg += "\n✅ هل تريد حفظ هذه البيانات؟ (نعم / الغاء)"
+            save_session(chat_id, "AWAITING_CONFIRMATION", data)
+            await send_telegram_message(chat_id, msg)
+            return
+    else:
+        # لم نفهم، نقدم مساعدة
+        await send_telegram_message(chat_id, "مرحباً! أنا مساعدك الذكي لتسجيل اليوميات.\nأرسل لي بيانات اليوم مثل:\n'5 عمال: أحمد، محمد، خالد، ساعة 8، مصاريف 10 دنانير'\nأو اكتب 'تقرير' لعرض تقرير، أو 'تقرير PDF'، أو 'تقرير Excel'.")
+        # نتعامل مع أوامر التقرير
+        if "تقرير" in text:
+            rows = get_all_logs()
+            if not rows:
+                await send_telegram_message(chat_id, "لا توجد سجلات بعد.")
+                return
+            if "pdf" in text.lower():
+                pdf = generate_pdf_report(rows)
+                await send_telegram_document(chat_id, "تقرير.pdf", pdf, "تقرير اليوميات")
+            elif "excel" in text.lower() or "اكسل" in text:
+                excel = generate_excel_report(rows)
+                await send_telegram_document(chat_id, "تقرير.xlsx", excel, "تقرير اليوميات")
+            else:
+                report = generate_text_report(rows)
+                await send_telegram_message(chat_id, report)
+        return
+
+# ========== حلقة Polling ==========
 async def delete_webhook():
     if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
     async with httpx.AsyncClient() as client:
         try:
-            res = await client.get(url, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("ok"):
-                    logger.info("✅ تم حذف webhook القديم بنجاح")
-                else:
-                    logger.warning(f"⚠️ فشل حذف webhook: {data}")
-            else:
-                logger.warning(f"⚠️ فشل حذف webhook: {res.status_code}")
-        except Exception as e:
-            logger.error(f"⚠️ استثناء أثناء حذف webhook: {e}")
+            await client.get(url, timeout=10)
+        except:
+            pass
 
 async def polling_loop():
     await delete_webhook()
     offset = 0
-    logger.info("🔄 بدء polling...")
+    logger.info("🔄 بدء polling (البوت الذكي للعمال)...")
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
@@ -614,19 +480,17 @@ async def polling_loop():
             logger.error(f"Polling exception: {e}")
         await asyncio.sleep(1)
 
-# ========== FastAPI Startup ==========
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN غير موجود")
+        logger.error("❌ TELEGRAM_BOT_TOKEN مفقود")
         return
     asyncio.create_task(polling_loop())
-    logger.info("✅ البوت يعمل عبر polling (تم حذف أي webhook سابق)")
+    logger.info("✅ البوت الذكي للعمال يعمل عبر polling")
 
 @app.get("/")
 async def root():
     return {"status": "running", "mode": "polling"}
 
-# ========== التشغيل ==========
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
