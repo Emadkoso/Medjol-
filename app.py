@@ -241,10 +241,36 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL UNIQUE,
             notes TEXT DEFAULT '',
+            agg_workers_count INTEGER,
+            agg_hours REAL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
+
+    # --------------------------------------------------------
+    # ترقية القواعد القديمة: إضافة عمودي الوضع التجميعي
+    # (عدد العمال + الساعات بدون أسماء) إذا لم يكونا موجودين
+    # --------------------------------------------------------
+
+    existing_columns = [
+        row["name"]
+        for row in c.execute(
+            "PRAGMA table_info(daily_logs)"
+        ).fetchall()
+    ]
+
+    if "agg_workers_count" not in existing_columns:
+        c.execute(
+            "ALTER TABLE daily_logs "
+            "ADD COLUMN agg_workers_count INTEGER"
+        )
+
+    if "agg_hours" not in existing_columns:
+        c.execute(
+            "ALTER TABLE daily_logs "
+            "ADD COLUMN agg_hours REAL"
+        )
 
     # --------------------------------------------------------
     # ساعات العمال
@@ -1738,8 +1764,266 @@ def get_daily_log(date_value):
         "date": daily["date"],
         "notes": daily["notes"] or "",
         "workers": workers,
-        "expenses": expenses
+        "expenses": expenses,
+        "agg_workers_count":
+            daily["agg_workers_count"],
+        "agg_hours": daily["agg_hours"]
     }
+
+
+def get_last_daily_log_date():
+
+    conn = db()
+
+    row = conn.execute(
+        """
+        SELECT date
+        FROM daily_logs
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    conn.close()
+
+    return row["date"] if row else None
+
+
+def delete_daily_log(date_value):
+
+    """
+    يحذف اليومية بالكامل (وتُحذف تلقائياً
+    ساعات العمال والمصاريف المرتبطة بها
+    عبر ON DELETE CASCADE).
+    """
+
+    conn = db()
+
+    try:
+
+        cursor = conn.execute(
+            """
+            DELETE FROM daily_logs
+            WHERE date = ?
+            """,
+            (date_value,)
+        )
+
+        conn.commit()
+
+        return cursor.rowcount > 0
+
+    finally:
+
+        conn.close()
+
+
+def update_daily_log_aggregate(
+    date_value,
+    agg_workers_count=None,
+    agg_hours=None
+):
+
+    """
+    تحديث عدد العمال و/أو الساعات في يومية
+    محفوظة بالوضع التجميعي (بدون أسماء).
+    """
+
+    conn = db()
+
+    try:
+
+        row = conn.execute(
+            """
+            SELECT id
+            FROM daily_logs
+            WHERE date = ?
+            """,
+            (date_value,)
+        ).fetchone()
+
+        if not row:
+            return False
+
+        if agg_workers_count is not None:
+
+            conn.execute(
+                """
+                UPDATE daily_logs
+                SET agg_workers_count = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    agg_workers_count,
+                    now_local().isoformat(),
+                    row["id"]
+                )
+            )
+
+        if agg_hours is not None:
+
+            conn.execute(
+                """
+                UPDATE daily_logs
+                SET agg_hours = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    agg_hours,
+                    now_local().isoformat(),
+                    row["id"]
+                )
+            )
+
+        conn.commit()
+
+        return True
+
+    finally:
+
+        conn.close()
+
+
+def update_daily_log_hours_for_all_workers(
+    date_value,
+    hours
+):
+
+    """
+    تحديث ساعات كل العمال المسجلين بالاسم
+    في يومية محفوظة (وضع الأسماء).
+    """
+
+    conn = db()
+
+    try:
+
+        row = conn.execute(
+            """
+            SELECT id
+            FROM daily_logs
+            WHERE date = ?
+            """,
+            (date_value,)
+        ).fetchone()
+
+        if not row:
+            return False
+
+        conn.execute(
+            """
+            UPDATE work_logs
+            SET hours = ?
+            WHERE daily_log_id = ?
+            """,
+            (
+                hours,
+                row["id"]
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE daily_logs
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                now_local().isoformat(),
+                row["id"]
+            )
+        )
+
+        conn.commit()
+
+        return True
+
+    finally:
+
+        conn.close()
+
+
+def replace_daily_log_expense_category(
+    date_value,
+    category,
+    new_amount,
+    notes=""
+):
+
+    """
+    يستبدل كل مصاريف فئة معيّنة (مثل الفطور)
+    بمبلغ جديد ضمن يومية محفوظة.
+    """
+
+    conn = db()
+
+    try:
+
+        row = conn.execute(
+            """
+            SELECT id
+            FROM daily_logs
+            WHERE date = ?
+            """,
+            (date_value,)
+        ).fetchone()
+
+        if not row:
+            return False
+
+        conn.execute(
+            """
+            DELETE FROM expenses
+            WHERE daily_log_id = ?
+              AND category = ?
+            """,
+            (
+                row["id"],
+                category
+            )
+        )
+
+        if new_amount and new_amount > 0:
+
+            conn.execute(
+                """
+                INSERT INTO expenses(
+                    daily_log_id,
+                    category,
+                    amount,
+                    notes
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    category,
+                    new_amount,
+                    notes
+                )
+            )
+
+        conn.execute(
+            """
+            UPDATE daily_logs
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                now_local().isoformat(),
+                row["id"]
+            )
+        )
+
+        conn.commit()
+
+        return True
+
+    finally:
+
+        conn.close()
 
 
 def daily_exists(date_value):
@@ -1807,14 +2091,22 @@ def save_daily_data(data):
             INSERT INTO daily_logs(
                 date,
                 notes,
+                agg_workers_count,
+                agg_hours,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 date_value,
                 notes,
+                data.get(
+                    "agg_workers_count"
+                ),
+                data.get(
+                    "agg_hours"
+                ),
                 now_local().isoformat(),
                 now_local().isoformat()
             )
@@ -1959,17 +2251,41 @@ def calculate_daily_total(log):
     breakfast = 0.0
     other_expenses = 0.0
 
-    for worker in log["workers"]:
+    if log["workers"]:
 
-        hours = float(
-            worker["hours"]
+        for worker in log["workers"]:
+
+            hours = float(
+                worker["hours"]
+            )
+
+            # السعر ثابت
+            wages += (
+                hours
+                * FIXED_HOURLY_RATE
+            )
+
+    else:
+
+        # وضع تجميعي: عدد عمال + ساعات بدون أسماء
+        agg_count = log.get(
+            "agg_workers_count"
         )
 
-        # السعر ثابت
-        wages += (
-            hours
-            * FIXED_HOURLY_RATE
+        agg_hours = log.get(
+            "agg_hours"
         )
+
+        if (
+            agg_count
+            and agg_hours is not None
+        ):
+
+            wages = (
+                float(agg_count)
+                * float(agg_hours)
+                * FIXED_HOURLY_RATE
+            )
 
     for expense in log["expenses"]:
 
@@ -2039,7 +2355,7 @@ def format_daily_summary(log):
 
     lines.append(
         f"👷 عدد العمال: "
-        f"{len(log['workers'])}"
+        f"{len(log['workers']) or log.get('agg_workers_count') or 0}"
     )
 
     if log["workers"]:
@@ -2066,6 +2382,19 @@ def format_daily_summary(log):
                 f"{FIXED_HOURLY_RATE:.2f} = "
                 f"{format_money(wage)}"
             )
+
+    elif log.get("agg_workers_count"):
+
+        agg_hours = log.get(
+            "agg_hours"
+        ) or 0
+
+        lines.append("")
+
+        lines.append(
+            f"⏱️ ساعات العمل لكل عامل: "
+            f"{agg_hours:g}"
+        )
 
     lines.append("")
 
@@ -2175,19 +2504,6 @@ def get_logs_between(
             FROM expenses
             WHERE daily_log_id = ?
             ORDER BY id
-            """
-        ).fetchall()
-
-        # تصحيح الاستعلام السابق بإعادة جلب المصاريف لليومية
-        expenses = conn.execute(
-            """
-            SELECT
-                category,
-                amount,
-                notes
-            FROM expenses
-            WHERE daily_log_id = ?
-            ORDER BY id
             """,
             (daily["id"],)
         ).fetchall()
@@ -2196,7 +2512,10 @@ def get_logs_between(
             "date": daily["date"],
             "notes": daily["notes"] or "",
             "workers": workers,
-            "expenses": expenses
+            "expenses": expenses,
+            "agg_workers_count":
+                daily["agg_workers_count"],
+            "agg_hours": daily["agg_hours"]
         })
 
     conn.close()
@@ -2229,43 +2548,45 @@ def generate_text_report(
 
     for log in logs:
 
-        wages = sum(
-            float(w["hours"])
-            * FIXED_HOURLY_RATE
-            for w in log["workers"]
-        )
-
-        breakfast = sum(
-            float(e["amount"])
-            for e in log["expenses"]
-            if (
-                e["category"]
-                or ""
-            ).strip().lower()
-            in ["فطور", "الفطور"]
-        )
-
-        other_expenses = sum(
-            float(e["amount"])
-            for e in log["expenses"]
-            if (
-                e["category"]
-                or ""
-            ).strip().lower()
-            not in ["فطور", "الفطور"]
-        )
-
-        total = (
-            wages
-            + breakfast
-            + other_expenses
-        )
+        (
+            wages,
+            breakfast,
+            other_expenses,
+            total
+        ) = calculate_daily_total(log)
 
         grand_wages += wages
         grand_breakfast += breakfast
         grand_other_expenses += (
             other_expenses
         )
+
+        if log["workers"]:
+
+            workers_count = len(
+                log["workers"]
+            )
+
+            total_hours = sum(
+                float(w["hours"])
+                for w in log["workers"]
+            )
+
+        else:
+
+            workers_count = (
+                log.get(
+                    "agg_workers_count"
+                ) or 0
+            )
+
+            total_hours = (
+                (
+                    log.get("agg_hours")
+                    or 0
+                )
+                * workers_count
+            )
 
         lines.append("")
 
@@ -2275,12 +2596,12 @@ def generate_text_report(
 
         lines.append(
             f"👷 العمال: "
-            f"{len(log['workers'])}"
+            f"{workers_count}"
         )
 
         lines.append(
             f"⏱️ مجموع الساعات: "
-            f"{sum(float(w['hours']) for w in log['workers']):.2f}"
+            f"{total_hours:.2f}"
         )
 
         lines.append(
@@ -2373,21 +2694,48 @@ def generate_excel_report(logs):
 
     for log in logs:
 
-        for worker in log["workers"]:
+        if log["workers"]:
 
-            hours = float(
-                worker["hours"]
+            for worker in log["workers"]:
+
+                hours = float(
+                    worker["hours"]
+                )
+
+                wage = (
+                    hours
+                    * FIXED_HOURLY_RATE
+                )
+
+                ws.append([
+                    log["date"],
+                    worker["name"],
+                    hours,
+                    FIXED_HOURLY_RATE,
+                    wage,
+                    log["notes"]
+                ])
+
+        elif log.get("agg_workers_count"):
+
+            agg_count = log[
+                "agg_workers_count"
+            ]
+
+            agg_hours = (
+                log.get("agg_hours") or 0
             )
 
             wage = (
-                hours
+                agg_count
+                * agg_hours
                 * FIXED_HOURLY_RATE
             )
 
             ws.append([
                 log["date"],
-                worker["name"],
-                hours,
+                f"{agg_count} عامل (بدون أسماء)",
+                agg_hours,
                 FIXED_HOURLY_RATE,
                 wage,
                 log["notes"]
@@ -2455,39 +2803,44 @@ def generate_excel_report(logs):
 
     for log in logs:
 
-        wages = sum(
-            float(w["hours"])
-            * FIXED_HOURLY_RATE
-            for w in log["workers"]
-        )
+        (
+            wages,
+            breakfast,
+            other,
+            _total
+        ) = calculate_daily_total(log)
 
-        breakfast = sum(
-            float(e["amount"])
-            for e in log["expenses"]
-            if (
-                e["category"]
-                or ""
-            ).strip().lower()
-            in ["فطور", "الفطور"]
-        )
+        if log["workers"]:
 
-        other = sum(
-            float(e["amount"])
-            for e in log["expenses"]
-            if (
-                e["category"]
-                or ""
-            ).strip().lower()
-            not in ["فطور", "الفطور"]
-        )
+            workers_count = len(
+                log["workers"]
+            )
+
+            total_hours = sum(
+                float(w["hours"])
+                for w in log["workers"]
+            )
+
+        else:
+
+            workers_count = (
+                log.get(
+                    "agg_workers_count"
+                ) or 0
+            )
+
+            total_hours = (
+                (
+                    log.get("agg_hours")
+                    or 0
+                )
+                * workers_count
+            )
 
         summary.append([
             log["date"],
-            len(log["workers"]),
-            sum(
-                float(w["hours"])
-                for w in log["workers"]
-            ),
+            workers_count,
+            total_hours,
             wages,
             breakfast,
             other,
@@ -2559,54 +2912,57 @@ def generate_pdf_report(logs):
 
     for log in logs:
 
-        wages = sum(
-            float(w["hours"])
-            * FIXED_HOURLY_RATE
-            for w in log["workers"]
-        )
-
-        breakfast = sum(
-            float(e["amount"])
-            for e in log["expenses"]
-            if (
-                e["category"]
-                or ""
-            ).strip().lower()
-            in ["فطور", "الفطور"]
-        )
-
-        other = sum(
-            float(e["amount"])
-            for e in log["expenses"]
-            if (
-                e["category"]
-                or ""
-            ).strip().lower()
-            not in ["فطور", "الفطور"]
-        )
+        (
+            wages,
+            breakfast,
+            other,
+            _total
+        ) = calculate_daily_total(log)
 
         grand_wages += wages
         grand_breakfast += breakfast
         grand_other += other
 
-        for worker in log["workers"]:
+        if log["workers"]:
 
-            hours = float(
-                worker["hours"]
-            )
+            for worker in log["workers"]:
 
-            wage = (
-                hours
-                * FIXED_HOURLY_RATE
+                hours = float(
+                    worker["hours"]
+                )
+
+                wage = (
+                    hours
+                    * FIXED_HOURLY_RATE
+                )
+
+                rows_html += f"""
+                <tr>
+                    <td>{html.escape(log["date"])}</td>
+                    <td>{html.escape(worker["name"])}</td>
+                    <td>{hours:g}</td>
+                    <td>{FIXED_HOURLY_RATE:.2f}</td>
+                    <td>{wage:.2f}</td>
+                </tr>
+                """
+
+        elif log.get("agg_workers_count"):
+
+            agg_count = log[
+                "agg_workers_count"
+            ]
+
+            agg_hours = (
+                log.get("agg_hours") or 0
             )
 
             rows_html += f"""
             <tr>
                 <td>{html.escape(log["date"])}</td>
-                <td>{html.escape(worker["name"])}</td>
-                <td>{hours:g}</td>
+                <td>{agg_count} عامل (بدون أسماء)</td>
+                <td>{agg_hours:g}</td>
                 <td>{FIXED_HOURLY_RATE:.2f}</td>
-                <td>{wage:.2f}</td>
+                <td>{wages:.2f}</td>
             </tr>
             """
 
@@ -2814,20 +3170,19 @@ def build_confirmation_data(
     # --------------------------------------------------------
     # العمال
     # --------------------------------------------------------
+    # ملاحظة: لا يتم إنشاء أي عامل في قاعدة البيانات هنا.
+    # إنشاء العمال يحدث فقط عند الحفظ الفعلي (save_daily_data)
+    # حتى لا يتلوث جدول العمال بأسماء ذُكرت في رسالة لم تُؤكَّد.
+    # --------------------------------------------------------
 
     workers = []
+
+    agg_workers_count = None
+    agg_hours = None
 
     if names:
 
         for name in names:
-
-            # إنشاء العامل إذا لم يكن موجوداً
-            existing = get_worker_by_name(
-                name
-            )
-
-            if not existing:
-                create_worker(name)
 
             workers.append({
                 "name": name,
@@ -2837,6 +3192,12 @@ def build_confirmation_data(
                 "task": "",
                 "notes": ""
             })
+
+    elif count:
+
+        # وضع تجميعي: عدد عمال + ساعات بدون أسماء
+        agg_workers_count = count
+        agg_hours = hours
 
     expenses = []
 
@@ -2874,6 +3235,12 @@ def build_confirmation_data(
 
         "workers":
             workers,
+
+        "agg_workers_count":
+            agg_workers_count,
+
+        "agg_hours":
+            agg_hours,
 
         "pending_hours":
             hours,
@@ -2959,18 +3326,49 @@ def build_confirmation_message(
 
     else:
 
-        lines.append(
-            f"👷 عدد العمال: "
-            f"{count or 'غير محدد'}"
+        agg_hours = data.get(
+            "agg_hours"
         )
 
-    wages = sum(
-        float(
-            w.get("hours") or 0
+        lines.append(
+            f"👷 عدد العمال: "
+            f"{count or 'غير محدد'} "
+            "(بدون أسماء)"
         )
-        * FIXED_HOURLY_RATE
-        for w in workers
-    )
+
+        if agg_hours is not None:
+
+            lines.append(
+                f"⏱️ ساعات العمل لكل عامل: "
+                f"{agg_hours:g}"
+            )
+
+    if workers:
+
+        wages = sum(
+            float(
+                w.get("hours") or 0
+            )
+            * FIXED_HOURLY_RATE
+            for w in workers
+        )
+
+    else:
+
+        agg_hours = data.get(
+            "agg_hours"
+        )
+
+        wages = (
+            float(count)
+            * float(agg_hours)
+            * FIXED_HOURLY_RATE
+            if (
+                count
+                and agg_hours is not None
+            )
+            else 0.0
+        )
 
     breakfast = sum(
         float(e["amount"])
@@ -3171,6 +3569,67 @@ async def edit_pending_data(
 
         data["pending_hours"] = hours
 
+        if data.get(
+            "agg_workers_count"
+        ):
+
+            data["agg_hours"] = hours
+
+        save_session(
+            chat_id,
+            "AWAITING_CONFIRMATION",
+            data
+        )
+
+        await send_message(
+            chat_id,
+            build_confirmation_message(
+                data
+            )
+        )
+
+        return True
+
+    # --------------------------------------------------------
+    # عدد العمال (وضع تجميعي بدون أسماء فقط)
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"(?:عدد\s+العمال|العمال)\s*"
+        r"(?:=|:)?\s*"
+        r"(\d+(?:[.,]\d+)?)",
+        t,
+        flags=re.IGNORECASE
+    )
+
+    if (
+        match
+        and not data.get("workers")
+    ):
+
+        count = int(
+            float(
+                match.group(1).replace(
+                    ",",
+                    "."
+                )
+            )
+        )
+
+        if not (
+            1 <= count <= MAX_WORKERS
+        ):
+
+            await send_message(
+                chat_id,
+                f"⚠️ عدد العمال يجب أن يكون بين 1 و{MAX_WORKERS}."
+            )
+
+            return True
+
+        data["workers_count"] = count
+        data["agg_workers_count"] = count
+
         save_session(
             chat_id,
             "AWAITING_CONFIRMATION",
@@ -3344,12 +3803,8 @@ async def edit_pending_data(
 
         if validate_worker_name(name):
 
-            existing = get_worker_by_name(
-                name
-            )
-
-            if not existing:
-                create_worker(name)
+            # لا يُنشأ العامل في قاعدة البيانات هنا؛
+            # ينشأ فقط عند الحفظ الفعلي في save_daily_data.
 
             data.setdefault(
                 "workers",
@@ -3369,6 +3824,11 @@ async def edit_pending_data(
             data["workers_count"] = len(
                 data["workers"]
             )
+
+            # إضافة اسم يعني التحول من الوضع التجميعي
+            # (عدد + ساعات بدون أسماء) إلى وضع الأسماء
+            data["agg_workers_count"] = None
+            data["agg_hours"] = None
 
             # إعادة حساب الفطور لكل العمال
             per_worker = data.get(
@@ -3423,6 +3883,303 @@ async def handle_active_session(
     data = session["data"]
 
     # --------------------------------------------------------
+    # تأكيد حذف يومية محفوظة
+    # --------------------------------------------------------
+
+    if step == "CONFIRM_DELETE_SAVED_LOG":
+
+        if is_yes(text):
+
+            deleted = delete_daily_log(
+                data["date"]
+            )
+
+            clear_session(chat_id)
+
+            if deleted:
+
+                await send_message(
+                    chat_id,
+                    f"✅ تم حذف اليومية بتاريخ "
+                    f"{data['date']} نهائياً."
+                )
+
+            else:
+
+                await send_message(
+                    chat_id,
+                    "⚠️ لم يتم العثور على اليومية "
+                    "(ربما حُذفت مسبقاً)."
+                )
+
+            return True
+
+        clear_session(chat_id)
+
+        await send_message(
+            chat_id,
+            "❌ تم إلغاء عملية الحذف."
+        )
+
+        return True
+
+    # --------------------------------------------------------
+    # تعديل يومية محفوظة مسبقاً
+    # --------------------------------------------------------
+
+    if step == "EDIT_SAVED_LOG":
+
+        date_value = data["date"]
+
+        t = normalize_text(text).lower().strip()
+
+        if t in {
+            "تم",
+            "انتهيت",
+            "خلص",
+            "حسنا",
+            "حسناً"
+        }:
+
+            clear_session(chat_id)
+
+            log = get_daily_log(
+                date_value
+            )
+
+            await send_message(
+                chat_id,
+                "✅ تم حفظ التعديلات.\n\n"
+                + format_daily_summary(log)
+            )
+
+            return True
+
+        if t in {
+            "الغاء",
+            "إلغاء",
+            "الغاء العملية"
+        }:
+
+            clear_session(chat_id)
+
+            await send_message(
+                chat_id,
+                "❌ تم إلغاء التعديل."
+            )
+
+            return True
+
+        log = get_daily_log(date_value)
+
+        is_named = bool(log["workers"])
+
+        # الساعات
+        match = re.search(
+            r"(?:الساعات|ساعات|ساعة|الساعه)"
+            r"\s*(?:=|:)?\s*"
+            r"(\d+(?:[.,]\d+)?)",
+            t,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            hours = float(
+                match.group(1).replace(
+                    ",",
+                    "."
+                )
+            )
+
+            if not (0 <= hours <= MAX_HOURS_PER_DAY):
+
+                await send_message(
+                    chat_id,
+                    f"⚠️ الساعات يجب أن تكون بين 0 و{MAX_HOURS_PER_DAY}."
+                )
+
+                return True
+
+            if is_named:
+
+                update_daily_log_hours_for_all_workers(
+                    date_value,
+                    hours
+                )
+
+            else:
+
+                update_daily_log_aggregate(
+                    date_value,
+                    agg_hours=hours
+                )
+
+            log = get_daily_log(date_value)
+
+            await send_message(
+                chat_id,
+                "✏️ تم تحديث الساعات.\n\n"
+                + format_daily_summary(log)
+                + "\n\nاكتب تعديلاً آخر، أو 'تم' للإنهاء."
+            )
+
+            return True
+
+        # عدد العمال (وضع تجميعي فقط)
+        match = re.search(
+            r"(?:عدد\s+العمال|العمال)\s*"
+            r"(?:=|:)?\s*"
+            r"(\d+(?:[.,]\d+)?)",
+            t,
+            flags=re.IGNORECASE
+        )
+
+        if match and not is_named:
+
+            count = int(
+                float(
+                    match.group(1).replace(
+                        ",",
+                        "."
+                    )
+                )
+            )
+
+            if not (1 <= count <= MAX_WORKERS):
+
+                await send_message(
+                    chat_id,
+                    f"⚠️ عدد العمال يجب أن يكون بين 1 و{MAX_WORKERS}."
+                )
+
+                return True
+
+            update_daily_log_aggregate(
+                date_value,
+                agg_workers_count=count
+            )
+
+            log = get_daily_log(date_value)
+
+            await send_message(
+                chat_id,
+                "✏️ تم تحديث عدد العمال.\n\n"
+                + format_daily_summary(log)
+                + "\n\nاكتب تعديلاً آخر، أو 'تم' للإنهاء."
+            )
+
+            return True
+
+        # فطور لكل عامل
+        match = re.search(
+            r"فطور\s+لكل\s+عامل\s*"
+            r"(?:=|:)?\s*"
+            r"(\d+(?:[.,]\d+)?)",
+            t,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            per_worker = float(
+                match.group(1).replace(
+                    ",",
+                    "."
+                )
+            )
+
+            count = (
+                len(log["workers"])
+                if is_named
+                else (
+                    log.get(
+                        "agg_workers_count"
+                    ) or 0
+                )
+            )
+
+            amount = count * per_worker
+
+            replace_daily_log_expense_category(
+                date_value,
+                "فطور",
+                amount,
+                notes=f"{per_worker:.2f} د.أ لكل عامل"
+            )
+
+            log = get_daily_log(date_value)
+
+            await send_message(
+                chat_id,
+                "✏️ تم تحديث الفطور.\n\n"
+                + format_daily_summary(log)
+                + "\n\nاكتب تعديلاً آخر، أو 'تم' للإنهاء."
+            )
+
+            return True
+
+        # المصاريف الأخرى
+        match = re.search(
+            r"(?:المصاريف|مصاريف|صرف|دفعت)"
+            r"\s*(?:=|:)?\s*"
+            r"(\d+(?:[.,]\d+)?)",
+            t,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            amount = float(
+                match.group(1).replace(
+                    ",",
+                    "."
+                )
+            )
+
+            if amount < 0:
+
+                await send_message(
+                    chat_id,
+                    "⚠️ المصروف لا يمكن أن يكون سالباً."
+                )
+
+                return True
+
+            replace_daily_log_expense_category(
+                date_value,
+                "عام",
+                amount
+            )
+
+            log = get_daily_log(date_value)
+
+            await send_message(
+                chat_id,
+                "✏️ تم تحديث المصاريف.\n\n"
+                + format_daily_summary(log)
+                + "\n\nاكتب تعديلاً آخر، أو 'تم' للإنهاء."
+            )
+
+            return True
+
+        await send_message(
+            chat_id,
+            "لم أفهم التعديل.\n\n"
+            "مثال: الساعات 7\n"
+            + (
+                "أو: عدد العمال 5\n"
+                if not is_named
+                else ""
+            )
+            + "أو: فطور لكل عامل 1\n"
+            "أو: المصاريف 15\n\n"
+            "اكتب 'تم' عند الانتهاء، أو 'إلغاء' للتراجع."
+        )
+
+        return True
+
+    # --------------------------------------------------------
     # CONFIRMATION
     # --------------------------------------------------------
 
@@ -3430,34 +4187,51 @@ async def handle_active_session(
 
         if is_yes(text):
 
-            if not data.get(
-                "workers"
+            has_named_workers = bool(
+                data.get("workers")
+            )
+
+            has_aggregate = (
+                data.get(
+                    "agg_workers_count"
+                )
+                and data.get(
+                    "agg_hours"
+                ) is not None
+            )
+
+            if (
+                not has_named_workers
+                and not has_aggregate
             ):
 
                 await send_message(
                     chat_id,
-                    "⚠️ لا يمكن الحفظ قبل تحديد أسماء العمال."
+                    "⚠️ لا يمكن الحفظ قبل تحديد "
+                    "عدد العمال وساعات العمل."
                 )
 
                 return True
 
-            missing_hours = [
-                w["name"]
-                for w in data["workers"]
-                if w.get("hours") is None
-            ]
+            if has_named_workers:
 
-            if missing_hours:
+                missing_hours = [
+                    w["name"]
+                    for w in data["workers"]
+                    if w.get("hours") is None
+                ]
 
-                await send_message(
-                    chat_id,
-                    "⚠️ لم يتم تحديد ساعات العمل لـ:\n"
-                    + "\n".join(
-                        missing_hours
+                if missing_hours:
+
+                    await send_message(
+                        chat_id,
+                        "⚠️ لم يتم تحديد ساعات العمل لـ:\n"
+                        + "\n".join(
+                            missing_hours
+                        )
                     )
-                )
 
-                return True
+                    return True
 
             if daily_exists(
                 data["date"]
@@ -3641,16 +4415,65 @@ async def handle_active_session(
             "workers_count"
         ] = count
 
+        data["agg_workers_count"] = count
+
         save_session(
             chat_id,
-            "ASK_NAMES",
+            "ASK_AGG_HOURS",
             data
         )
 
         await send_message(
             chat_id,
             f"👷 تم تسجيل {count} عمال.\n"
-            "اكتب أسماءهم مفصولة بفواصل."
+            "⏱️ كم ساعة عمل لكل عامل؟"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # AGGREGATE HOURS (وضع بدون أسماء: عدد + ساعات فقط)
+    # --------------------------------------------------------
+
+    if step == "ASK_AGG_HOURS":
+
+        hours = number_from_text(
+            text
+        )
+
+        if hours is None:
+
+            await send_message(
+                chat_id,
+                "اكتب عدد الساعات كرقم، مثل: 8"
+            )
+
+            return True
+
+        if not (
+            0 <= hours <= MAX_HOURS_PER_DAY
+        ):
+
+            await send_message(
+                chat_id,
+                f"ساعات العمل يجب أن تكون بين 0 و{MAX_HOURS_PER_DAY}."
+            )
+
+            return True
+
+        data["agg_hours"] = hours
+
+        save_session(
+            chat_id,
+            "AWAITING_CONFIRMATION",
+            data
+        )
+
+        await send_message(
+            chat_id,
+            build_confirmation_message(
+                data
+            )
         )
 
         return True
@@ -4040,1054 +4863,4 @@ async def handle_active_session(
                 for e in data.get(
                     "expenses",
                     []
-                )
-                if e.get("category")
-                in ["فطور", "الفطور"]
-            ]
-
-        else:
-
-            amount = number_from_text(
-                text
-            )
-
-            if amount is None:
-
-                await send_message(
-                    chat_id,
-                    "اكتب مبلغ المصاريف أو «لا»."
-                )
-
-                return True
-
-            if not (
-                0 <= amount <= MAX_EXPENSE
-            ):
-
-                await send_message(
-                    chat_id,
-                    "⚠️ قيمة المصاريف غير صحيحة."
-                )
-
-                return True
-
-            data["expenses"] = [
-                e
-                for e in data.get(
-                    "expenses",
-                    []
-                )
-                if e.get("category")
-                in ["فطور", "الفطور"]
-            ]
-
-            if amount > 0:
-
-                data["expenses"].append({
-                    "category": "عام",
-                    "amount": amount,
-                    "notes": ""
-                })
-
-        save_session(
-            chat_id,
-            "ASK_NOTES",
-            data
-        )
-
-        await send_message(
-            chat_id,
-            "📝 هل توجد ملاحظات؟\n"
-            "اكتبها أو «لا»."
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # NOTES
-    # --------------------------------------------------------
-
-    if step == "ASK_NOTES":
-
-        if is_no(text):
-
-            data["notes"] = ""
-
-        else:
-
-            data["notes"] = (
-                text.strip()[:1000]
-            )
-
-        save_session(
-            chat_id,
-            "AWAITING_CONFIRMATION",
-            data
-        )
-
-        await send_message(
-            chat_id,
-            build_confirmation_message(
-                data
-            )
-        )
-
-        return True
-
-    return False
-
-
-# ============================================================
-# COMMANDS
-# ============================================================
-
-async def handle_command(
-    chat_id,
-    text
-):
-
-    normalized = normalize_text(
-        text
-    ).lower().strip()
-
-    # --------------------------------------------------------
-    # CANCEL
-    # --------------------------------------------------------
-
-    if normalized in {
-        "/cancel",
-        "الغاء",
-        "إلغاء",
-        "الغاء العملية"
-    }:
-
-        clear_session(
-            chat_id
-        )
-
-        await send_message(
-            chat_id,
-            "❌ تم إلغاء العملية."
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # HELP
-    # --------------------------------------------------------
-
-    if normalized in {
-        "/start",
-        "/help",
-        "مساعدة"
-    }:
-
-        clear_session(
-            chat_id
-        )
-
-        await send_message(
-            chat_id,
-            """
-🤖 أهلاً بك في Medjol Farm Manager V3
-
-أرسل بيانات العمل بطريقتك الطبيعية.
-
-مثال كامل:
-
-"اليوم اشتغل أحمد ومحمد وخالد 8 ساعات، فطور لكل عامل دينار، ومصاريف 10 دنانير"
-
-سأفهم تلقائياً:
-
-📅 التاريخ
-👷 العمال
-⏱️ ساعات العمل
-💵 أجر الساعة = 1.50 د.أ ثابت
-🍳 الفطور
-💰 المصاريف
-📝 الملاحظات
-
-مثال آخر:
-
-"أمس كان عندي 5 عمال، كل واحد 7 ساعات، الفطور لكل عامل 1 دينار، والبنزين 5 دنانير"
-
-الأوامر:
-
-📋 تقرير
-📅 تقرير اليوم
-📆 تقرير الأسبوع
-🗓️ تقرير الشهر
-📄 تقرير PDF
-📗 تقرير Excel
-
-👷 العمال
-➕ أضف العامل أحمد
-❌ احذف العامل أحمد
-
-❌ إلغاء
-"""
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # WORKERS
-    # --------------------------------------------------------
-
-    if normalized in {
-        "العمال",
-        "قائمة العمال",
-        "/workers"
-    }:
-
-        workers = get_active_workers()
-
-        if not workers:
-
-            await send_message(
-                chat_id,
-                "لا يوجد عمال مسجلون."
-            )
-
-            return True
-
-        lines = [
-            "👷 العمال المسجلون:",
-            ""
-        ]
-
-        for i, worker in enumerate(
-            workers,
-            1
-        ):
-
-            lines.append(
-                f"{i}. {worker['name']} "
-                f"— {FIXED_HOURLY_RATE:.2f} د.أ/ساعة"
-            )
-
-        await send_message(
-            chat_id,
-            "\n".join(lines)
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # ADD WORKER
-    # --------------------------------------------------------
-
-    if (
-        normalized.startswith(
-            "اضف العامل "
-        )
-        or normalized.startswith(
-            "أضف العامل "
-        )
-        or normalized.startswith(
-            "/addworker "
-        )
-    ):
-
-        if normalized.startswith(
-            "/addworker "
-        ):
-
-            name = text.split(
-                " ",
-                1
-            )[1]
-
-        else:
-
-            name = re.sub(
-                r"^(اضف|أضف)\s+العامل\s+",
-                "",
-                text,
-                flags=re.IGNORECASE
-            )
-
-        name = normalize_name(
-            name
-        )
-
-        if not validate_worker_name(
-            name
-        ):
-
-            await send_message(
-                chat_id,
-                "⚠️ اسم العامل غير واضح."
-            )
-
-            return True
-
-        if get_worker_by_name(
-            name
-        ):
-
-            await send_message(
-                chat_id,
-                f"⚠️ العامل {name} موجود بالفعل."
-            )
-
-            return True
-
-        create_worker(
-            name
-        )
-
-        await send_message(
-            chat_id,
-            f"✅ تم إضافة العامل: {name}"
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # DELETE WORKER
-    # --------------------------------------------------------
-
-    if (
-        normalized.startswith(
-            "احذف العامل "
-        )
-        or normalized.startswith(
-            "حذف العامل "
-        )
-    ):
-
-        name = re.sub(
-            r"^(احذف|حذف)\s+العامل\s+",
-            "",
-            text,
-            flags=re.IGNORECASE
-        )
-
-        name = normalize_name(
-            name
-        )
-
-        if deactivate_worker(
-            name
-        ):
-
-            await send_message(
-                chat_id,
-                f"✅ تم تعطيل العامل: {name}"
-            )
-
-        else:
-
-            await send_message(
-                chat_id,
-                f"⚠️ لم أجد العامل: {name}"
-            )
-
-        return True
-
-    # --------------------------------------------------------
-    # RATE - ممنوع تغييره
-    # --------------------------------------------------------
-
-    if re.search(
-        r"(?:أجر|اجر|سعر)\s*(?:الساعة|الساعه)",
-        normalized
-    ):
-
-        await send_message(
-            chat_id,
-            "ℹ️ أجر الساعة ثابت في النظام: "
-            "1.50 د.أ لكل ساعة."
-        )
-
-        return True
-
-    return False
-
-
-# ============================================================
-# REPORT COMMANDS
-# ============================================================
-
-async def handle_report_command(
-    chat_id,
-    text
-):
-
-    t = normalize_text(
-        text
-    ).lower().strip()
-
-    is_report = (
-        t.startswith("تقرير")
-        or t in {
-            "/report",
-            "report"
-        }
-    )
-
-    if not is_report:
-        return False
-
-    today = now_local().date()
-
-    # --------------------------------------------------------
-    # التاريخ
-    # --------------------------------------------------------
-
-    if "اليوم" in t:
-
-        date_from = today
-        date_to = today
-
-    elif (
-        "اسبوع" in t
-        or "أسبوع" in t
-    ):
-
-        date_from = (
-            today
-            - timedelta(
-                days=today.weekday()
-            )
-        )
-
-        date_to = today
-
-    elif (
-        "شهر" in t
-        or "شهري" in t
-    ):
-
-        date_from = today.replace(
-            day=1
-        )
-
-        date_to = today
-
-    else:
-
-        date_from = date(
-            2000,
-            1,
-            1
-        )
-
-        date_to = today
-
-    logs = get_logs_between(
-        date_from.isoformat(),
-        date_to.isoformat()
-    )
-
-    # --------------------------------------------------------
-    # PDF
-    # --------------------------------------------------------
-
-    if "pdf" in t:
-
-        if not logs:
-
-            await send_message(
-                chat_id,
-                "لا توجد بيانات لإنشاء التقرير."
-            )
-
-            return True
-
-        try:
-
-            pdf = generate_pdf_report(
-                logs
-            )
-
-            await send_document(
-                chat_id,
-                "تقرير_المزرعة.pdf",
-                pdf,
-                "📄 تقرير المزرعة"
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                "PDF failed: %s",
-                e
-            )
-
-            await send_message(
-                chat_id,
-                "❌ تعذر إنشاء ملف PDF."
-            )
-
-        return True
-
-    # --------------------------------------------------------
-    # EXCEL
-    # --------------------------------------------------------
-
-    if (
-        "excel" in t
-        or "اكسل" in t
-        or "إكسل" in t
-    ):
-
-        if not logs:
-
-            await send_message(
-                chat_id,
-                "لا توجد بيانات لإنشاء التقرير."
-            )
-
-            return True
-
-        try:
-
-            excel = generate_excel_report(
-                logs
-            )
-
-            await send_document(
-                chat_id,
-                "تقرير_المزرعة.xlsx",
-                excel,
-                "📗 تقرير المزرعة"
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                "Excel failed: %s",
-                e
-            )
-
-            await send_message(
-                chat_id,
-                "❌ تعذر إنشاء ملف Excel."
-            )
-
-        return True
-
-    # --------------------------------------------------------
-    # TEXT
-    # --------------------------------------------------------
-
-    if date_from == date_to:
-
-        title = (
-            f"📊 تقرير يوم "
-            f"{date_from.isoformat()}"
-        )
-
-    else:
-
-        title = (
-            f"📊 التقرير من "
-            f"{date_from.isoformat()} "
-            f"إلى "
-            f"{date_to.isoformat()}"
-        )
-
-    report = generate_text_report(
-        logs,
-        title
-    )
-
-    await send_message(
-        chat_id,
-        report
-    )
-
-    return True
-
-
-# ============================================================
-# MAIN MESSAGE HANDLER
-# ============================================================
-
-async def handle_incoming_message(
-    chat_id,
-    text
-):
-
-    text = text.strip()
-
-    if not text:
-        return
-
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
-    if await handle_command(
-        chat_id,
-        text
-    ):
-        return
-
-    # --------------------------------------------------------
-    # SESSION
-    # --------------------------------------------------------
-
-    session = get_session(
-        chat_id
-    )
-
-    if session:
-
-        await handle_active_session(
-            chat_id,
-            text,
-            session
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # REPORTS
-    # --------------------------------------------------------
-
-    if await handle_report_command(
-        chat_id,
-        text
-    ):
-        return
-
-    # --------------------------------------------------------
-    # AI
-    # --------------------------------------------------------
-
-    await send_message(
-        chat_id,
-        "⏳ جارٍ فهم البيانات..."
-    )
-
-    ai_data = await extract_data_with_ai(
-        text
-    )
-
-    # --------------------------------------------------------
-    # FALLBACK
-    # --------------------------------------------------------
-
-    if not ai_data:
-
-        ai_data = deterministic_extract(
-            text
-        )
-
-    if not ai_data:
-
-        await send_message(
-            chat_id,
-            """
-لم أستطع فهم الرسالة بشكل موثوق.
-
-جرب مثلاً:
-
-"اليوم اشتغل أحمد ومحمد 8 ساعات، فطور لكل عامل 1 دينار، ومصاريف 10"
-
-أو:
-
-"أمس 5 عمال، 7 ساعات، الفطور لكل عامل دينار، والبنزين 5 دنانير"
-"""
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # VALIDATION ERROR
-    # --------------------------------------------------------
-
-    if ai_data.get(
-        "_validation_error"
-    ):
-
-        await send_message(
-            chat_id,
-            "⚠️ "
-            + ai_data[
-                "_validation_error"
-            ]
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # BUILD DATA
-    # --------------------------------------------------------
-
-    data = build_confirmation_data(
-        ai_data
-    )
-
-    names = data.get(
-        "workers",
-        []
-    )
-
-    count = data.get(
-        "workers_count"
-    )
-
-    # --------------------------------------------------------
-    # NO WORKERS
-    # --------------------------------------------------------
-
-    if not count and not names:
-
-        save_session(
-            chat_id,
-            "ASK_WORKERS_COUNT",
-            data
-        )
-
-        await send_message(
-            chat_id,
-            "👷 كم عدد العمال؟"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # COUNT BUT NO NAMES
-    # --------------------------------------------------------
-
-    if count and not names:
-
-        save_session(
-            chat_id,
-            "ASK_NAMES",
-            data
-        )
-
-        await send_message(
-            chat_id,
-            f"👷 فهمت أن عدد العمال {count}.\n"
-            "اكتب أسماء العمال مفصولة بفواصل."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # NAMES BUT COUNT CONFLICT
-    # --------------------------------------------------------
-
-    if (
-        count
-        and names
-        and len(names) != count
-    ):
-
-        await send_message(
-            chat_id,
-            f"⚠️ ذكرت {count} عمال "
-            f"لكن وجدت {len(names)} أسماء.\n"
-            "لن أخمّن.\n\n"
-            "اكتب العدد الصحيح."
-        )
-
-        data[
-            "workers_count"
-        ] = None
-
-        save_session(
-            chat_id,
-            "ASK_WORKERS_COUNT",
-            data
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # HOURS MISSING
-    # --------------------------------------------------------
-
-    missing_hours = [
-        w["name"]
-        for w in names
-        if w.get("hours") is None
-    ]
-
-    if missing_hours:
-
-        save_session(
-            chat_id,
-            "ASK_HOURS",
-            data
-        )
-
-        await send_message(
-            chat_id,
-            "⏱️ كم ساعة عمل لكل عامل؟\n"
-            "إذا كانت الساعات متساوية اكتب رقماً واحداً."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # إذا لم يذكر فطور أو مصاريف
-    # لا نسأله عنها إذا كانت الرسالة مكتملة.
-    # تعتبر 0 تلقائياً.
-    # --------------------------------------------------------
-
-    save_session(
-        chat_id,
-        "AWAITING_CONFIRMATION",
-        data
-    )
-
-    await send_message(
-        chat_id,
-        build_confirmation_message(
-            data
-        )
-    )
-
-
-# ============================================================
-# TELEGRAM POLLING
-# ============================================================
-
-async def delete_webhook():
-
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
-    )
-
-    try:
-
-        async with httpx.AsyncClient() as client:
-
-            await client.get(
-                url,
-                params={
-                    "drop_pending_updates": False
-                },
-                timeout=15
-            )
-
-    except Exception as e:
-
-        logger.error(
-            "Webhook deletion failed: %s",
-            e
-        )
-
-
-async def polling_loop():
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        logger.error(
-            "❌ لا يمكن تشغيل Telegram بدون TELEGRAM_BOT_TOKEN"
-        )
-
-        return
-
-    await delete_webhook()
-
-    offset = 0
-
-    logger.info(
-        "🚀 Medjol Farm Manager V3 started"
-    )
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    )
-
-    async with httpx.AsyncClient() as client:
-
-        while True:
-
-            try:
-
-                response = await client.get(
-                    url,
-                    params={
-                        "offset": offset,
-                        "timeout": 30,
-                        "allowed_updates":
-                            json.dumps(
-                                ["message"]
-                            )
-                    },
-                    timeout=40
-                )
-
-                if response.status_code != 200:
-
-                    logger.error(
-                        "Polling HTTP error: %s",
-                        response.status_code
-                    )
-
-                    await asyncio.sleep(3)
-
-                    continue
-
-                updates = response.json().get(
-                    "result",
-                    []
-                )
-
-                for update in updates:
-
-                    offset = (
-                        update["update_id"]
-                        + 1
-                    )
-
-                    message = update.get(
-                        "message"
-                    )
-
-                    if not message:
-                        continue
-
-                    if "text" not in message:
-                        continue
-
-                    chat = message.get(
-                        "chat",
-                        {}
-                    )
-
-                    chat_id = chat.get(
-                        "id"
-                    )
-
-                    text = message.get(
-                        "text",
-                        ""
-                    ).strip()
-
-                    if not chat_id or not text:
-                        continue
-
-                    try:
-
-                        await handle_incoming_message(
-                            chat_id,
-                            text
-                        )
-
-                    except Exception as e:
-
-                        logger.exception(
-                            "Message handling error: %s",
-                            e
-                        )
-
-                        await send_message(
-                            chat_id,
-                            "❌ حدث خطأ غير متوقع. "
-                            "لم يتم حفظ هذه العملية."
-                        )
-
-            except asyncio.CancelledError:
-
-                raise
-
-            except Exception as e:
-
-                logger.exception(
-                    "Polling exception: %s",
-                    e
-                )
-
-                await asyncio.sleep(5)
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-polling_task = None
-
-
-@app.on_event("startup")
-async def startup():
-
-    global polling_task
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        logger.error(
-            "❌ TELEGRAM_BOT_TOKEN غير موجود"
-        )
-
-        return
-
-    if (
-        polling_task is None
-        or polling_task.done()
-    ):
-
-        polling_task = asyncio.create_task(
-            polling_loop()
-        )
-
-    logger.info(
-        "✅ Bot polling started"
-    )
-
-
-@app.on_event("shutdown")
-async def shutdown():
-
-    global polling_task
-
-    if polling_task:
-
-        polling_task.cancel()
-
-        try:
-            await polling_task
-        except asyncio.CancelledError:
-            pass
-
-        polling_task = None
-
-
-@app.get("/")
-async def root():
-
-    return {
-        "status": "running",
-        "name": "Medjol Farm Manager",
-        "version": "3.0",
-        "mode": "polling",
-        "hourly_rate": FIXED_HOURLY_RATE,
-        "timezone": TIMEZONE
-    }
-
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "healthy",
-        "time": now_local().isoformat(),
-        "hourly_rate": FIXED_HOURLY_RATE
-    }
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT
-    )
+               
