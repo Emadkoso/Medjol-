@@ -3,9 +3,10 @@ import re
 import sqlite3
 import json
 import logging
+import asyncio
 from io import BytesIO
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 import httpx
 from openpyxl import Workbook
 from weasyprint import HTML
@@ -20,7 +21,7 @@ app = FastAPI()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثال: https://your-app.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # يجب أن يكون كاملاً مثل: https://your-app.onrender.com/tg-webhook
 PORT = int(os.getenv("PORT", 8000))
 
 DB_NAME = "harvest.db"
@@ -60,6 +61,9 @@ init_db()
 
 # ===== دوال مساعدة لإرسال الرسائل =====
 async def send_telegram_message(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
@@ -70,6 +74,9 @@ async def send_telegram_message(chat_id: int, text: str):
             logger.error(f"Telegram sendMessage exception: {e}")
 
 async def send_telegram_document(chat_id: int, filename: str, content: bytes, caption: str = ""):
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     files = {"document": (filename, content)}
     data = {"chat_id": chat_id, "caption": caption}
@@ -81,7 +88,7 @@ async def send_telegram_document(chat_id: int, filename: str, content: bytes, ca
         except Exception as e:
             logger.error(f"Telegram sendDocument exception: {e}")
 
-# ===== استخراج الأرقام (نفس الكود السابق) =====
+# ===== استخراج الأرقام =====
 ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 ARABIC_NUMBER_WORDS = {
     "صفر": 0, "واحد": 1, "وحدة": 1, "اثنين": 2, "اثنان": 2,
@@ -229,112 +236,278 @@ async def analyze_message(text: str) -> dict:
             logger.error(f"AI request exception: {e}")
     return {"intent": "other"}
 
-# ===== دوال الحالة والحوار (نفس الكود السابق) =====
-# (جميع دوال get_state, save_state, clear_state, next_missing_step, question_for_step, build_confirmation_text, handle_guided_answer, start_guided_flow تبقى كما هي)
-# لتوفير المساحة، سأختصرها ولكنها موجودة في الكود النهائي المرفق.
+# ===== دوال الحالة والحوار =====
+def get_state(chat_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM conversation_state WHERE chat_id = ?", (chat_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    cols = ["chat_id", "step", "date", "workers_count", "wage_mode",
+            "hours", "wage_per_hour", "wage_per_worker", "expenses", "notes"]
+    return dict(zip(cols, row))
 
-# ===== دوال التحديث والتقارير =====
-# (query_records, format_text_report, generate_excel_report, generate_pdf_report, handle_update, handle_report تبقى كما هي)
+def save_state(chat_id: int, **fields):
+    existing = get_state(chat_id)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    if existing:
+        merged = {**existing, **fields}
+        cursor.execute('''
+            UPDATE conversation_state SET step=?, date=?, workers_count=?, wage_mode=?,
+                hours=?, wage_per_hour=?, wage_per_worker=?, expenses=?, notes=?
+            WHERE chat_id=?
+        ''', (merged["step"], merged["date"], merged["workers_count"], merged["wage_mode"],
+              merged["hours"], merged["wage_per_hour"], merged["wage_per_worker"],
+              merged["expenses"], merged["notes"], chat_id))
+    else:
+        defaults = {
+            "step": None, "date": datetime.now().strftime("%Y-%m-%d"),
+            "workers_count": None, "wage_mode": None, "hours": None,
+            "wage_per_hour": None, "wage_per_worker": None, "expenses": None, "notes": ""
+        }
+        merged = {**defaults, **fields}
+        cursor.execute('''
+            INSERT INTO conversation_state
+            (chat_id, step, date, workers_count, wage_mode, hours, wage_per_hour, wage_per_worker, expenses, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, merged["step"], merged["date"], merged["workers_count"], merged["wage_mode"],
+              merged["hours"], merged["wage_per_hour"], merged["wage_per_worker"],
+              merged["expenses"], merged["notes"]))
+    conn.commit()
+    conn.close()
 
-# ===== المعالج الرئيسي =====
-async def handle_incoming_message(chat_id: int, text: str):
-    # إرسال رسالة فورية لتأكيد الاستلام
-    await send_telegram_message(chat_id, "⏳ جارٍ معالجة طلبك...")
+def clear_state(chat_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM conversation_state WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
 
-    try:
-        state = get_state(chat_id)
-        if state and state.get("step") not in [None, "CONFIRM"]:
-            await handle_guided_answer(chat_id, text, state)
+def next_missing_step(state: dict) -> str:
+    if not state.get("workers_count"):
+        return "ASK_WORKERS"
+    if not state.get("wage_per_worker"):
+        if not state.get("wage_mode"):
+            return "ASK_WAGE_MODE"
+        if state["wage_mode"] == "hourly":
+            if not state.get("hours"):
+                return "ASK_HOURS"
+            if not state.get("wage_per_hour"):
+                return "ASK_WAGE_PER_HOUR"
+        else:
+            return "ASK_WAGE_DAILY"
+    if state.get("expenses") is None:
+        return "ASK_EXPENSES"
+    return "CONFIRM"
+
+def question_for_step(step: str) -> str:
+    return {
+        "ASK_WORKERS": "🧑‍🌾 كم عدد العمال الذين اشتغلوا معك؟",
+        "ASK_WAGE_MODE": "💵 كيف تحدد الأجرة؟\n1️⃣ أجرة يومية مباشرة للعامل\n2️⃣ بالساعة (عدد الساعات × سعر الساعة)\n\nاكتب 1 أو 2.",
+        "ASK_HOURS": "⏱️ كم عدد ساعات العمل؟",
+        "ASK_WAGE_PER_HOUR": "💰 كم أجرة الساعة الواحدة (بالدينار)؟",
+        "ASK_WAGE_DAILY": "💰 كم أجرة العامل الواحد لهذا اليوم (بالدينار)؟",
+        "ASK_EXPENSES": "🧾 هل هناك مصاريف إضافية (بنزين، أكل، نقل...)؟\nاكتب المجموع، أو اكتب 'لا' إذا لا يوجد.",
+    }.get(step, "")
+
+def build_confirmation_text(state: dict) -> str:
+    wage = state.get("wage_per_worker") or 0
+    workers = state.get("workers_count") or 0
+    expenses = state.get("expenses") or 0
+    total = (workers * wage) + expenses
+    return (
+        f"📋 راجع البيانات قبل الحفظ ({state.get('date')}):\n"
+        f"- عدد العمال: {workers}\n"
+        f"- أجرة العامل: {wage:.2f} د.أ\n"
+        f"- المصاريف: {expenses:.2f} د.أ\n"
+        f"- المجموع الكلي: {total:.2f} د.أ\n\n"
+        f"✅ اكتب 'نعم' للحفظ، أو ❌ 'الغاء' للإلغاء."
+    )
+
+NO_EXPENSE_WORDS = ["لا", "ﻻ", "لا يوجد", "ماكو", "ولا شي", "بدون", "no", "0"]
+YES_WORDS = ["نعم", "ايوه", "ايه", "تمام", "صح", "اوك", "ok", "yes", "احفظ", "أكيد"]
+CANCEL_WORDS = ["الغاء", "إلغاء", "كنسل", "cancel", "لغي", "الغي"]
+
+async def handle_guided_answer(chat_id: int, text: str, state: dict):
+    step = state["step"]
+    stripped = text.strip()
+
+    if step == "ASK_WORKERS":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم عدد العمال؟ (اكتب رقماً فقط)")
+            return
+        state["workers_count"] = int(num)
+
+    elif step == "ASK_WAGE_MODE":
+        if "2" in stripped or "ساعة" in stripped:
+            state["wage_mode"] = "hourly"
+        elif "1" in stripped or "يومي" in stripped or "مباشر" in stripped:
+            state["wage_mode"] = "daily"
+        else:
+            await send_telegram_message(chat_id, "من فضلك اكتب 1 (أجرة يومية مباشرة) أو 2 (بالساعة).")
             return
 
-        analysis = await analyze_message(text)
-        intent = analysis.get("intent", "other")
+    elif step == "ASK_HOURS":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم عدد ساعات العمل؟")
+            return
+        state["hours"] = num
 
-        if intent == "record":
-            await start_guided_flow(chat_id, analysis)
-        elif intent == "update":
-            await handle_update(chat_id, analysis)
-        elif intent == "report":
-            await handle_report(chat_id, analysis)
+    elif step == "ASK_WAGE_PER_HOUR":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم أجرة الساعة الواحدة؟")
+            return
+        state["wage_per_hour"] = num
+        state["wage_per_worker"] = (state.get("hours") or 0) * num
+        state["notes"] = (state.get("notes") or "") + f" {state['hours']}س×{num}د/س={state['wage_per_worker']:.2f}د للعامل"
+
+    elif step == "ASK_WAGE_DAILY":
+        num = extract_number(stripped) or await extract_number_ai(stripped)
+        if num is None:
+            await send_telegram_message(chat_id, "لم أفهم الرقم 🙏 كم أجرة العامل اليومية؟")
+            return
+        state["wage_per_worker"] = num
+
+    elif step == "ASK_EXPENSES":
+        if any(w in stripped for w in NO_EXPENSE_WORDS) and extract_number(stripped) is None:
+            state["expenses"] = 0.0
         else:
+            num = extract_number(stripped) or await extract_number_ai(stripped)
+            if num is None:
+                await send_telegram_message(chat_id, "لم أفهم 🙏 اكتب مبلغ المصاريف كرقم، أو 'لا' إذا لا يوجد.")
+                return
+            state["expenses"] = num
+
+    elif step == "CONFIRM":
+        if any(w in stripped for w in YES_WORDS):
+            workers = state.get("workers_count") or 0
+            wage = state.get("wage_per_worker") or 0
+            expenses = state.get("expenses") or 0
+            notes = (state.get("notes") or "").strip()
+            record_date = state.get("date") or datetime.now().strftime("%Y-%m-%d")
+
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO daily_records (date, workers_count, wage_per_worker, expenses, notes) VALUES (?, ?, ?, ?, ?)",
+                (record_date, workers, wage, expenses, notes)
+            )
+            conn.commit()
+            conn.close()
+            clear_state(chat_id)
+
+            total = (workers * wage) + expenses
             await send_telegram_message(
                 chat_id,
-                "مرحباً! أرسل لي تفاصيل اليومية (مثل: 5 عمال، 10 دنانير لكل عامل)، أو اطلب تقريراً، أو قم بتحديث سابق."
+                f"✅ تم حفظ اليومية بنجاح! ({record_date})\n"
+                f"- عدد العمال: {workers}\n"
+                f"- أجرة العامل: {wage:.2f} د.أ\n"
+                f"- المصاريف: {expenses:.2f} د.أ\n"
+                f"- المجموع الكلي: {total:.2f} د.أ"
             )
-    except Exception as e:
-        logger.error(f"Error in handle_incoming_message: {e}", exc_info=True)
-        await send_telegram_message(chat_id, "❌ حدث خطأ ما، حاول مرة أخرى لاحقاً.")
+        elif any(w in stripped for w in CANCEL_WORDS):
+            clear_state(chat_id)
+            await send_telegram_message(chat_id, "❌ تم إلغاء العملية، لم يُحفظ أي شيء.")
+        else:
+            await send_telegram_message(chat_id, "من فضلك اكتب 'نعم' للحفظ أو 'الغاء' للإلغاء.")
+        return
 
-# ===== نقطة نهاية Webhook =====
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        data = await request.json()
-        logger.info(f"Incoming update: {data}")
-        if "message" in data and "text" in data["message"]:
-            chat_id = data["message"]["chat"]["id"]
-            text = data["message"]["text"].strip()
-            # إطلاق المعالج في الخلفية حتى لا نؤخر الرد على Telegram
-            import asyncio
-            asyncio.create_task(handle_incoming_message(chat_id, text))
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Webhook error: {e}", exc_info=True)
-        return {"ok": False}
+    step_after = next_missing_step(state)
+    save_state(
+        chat_id, step=step_after, date=state.get("date"),
+        workers_count=state.get("workers_count"), wage_mode=state.get("wage_mode"),
+        hours=state.get("hours"), wage_per_hour=state.get("wage_per_hour"),
+        wage_per_worker=state.get("wage_per_worker"), expenses=state.get("expenses"),
+        notes=state.get("notes")
+    )
 
-# ===== نقطة بديلة للاختبار (polling) =====
-# يمكن تشغيلها كـ fallback إذا فشل webhook
-async def polling_loop():
-    """حلقة بسيطة لسحب التحديثات (بديل للـ webhook)"""
-    offset = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            async with httpx.AsyncClient() as client:
-                res = await client.get(url, timeout=35)
-                if res.status_code == 200:
-                    updates = res.json().get("result", [])
-                    for update in updates:
-                        offset = update["update_id"] + 1
-                        if "message" in update and "text" in update["message"]:
-                            chat_id = update["message"]["chat"]["id"]
-                            text = update["message"]["text"].strip()
-                            await handle_incoming_message(chat_id, text)
-                else:
-                    logger.error(f"Polling error: {res.status_code}")
-        except Exception as e:
-            logger.error(f"Polling exception: {e}")
-        await asyncio.sleep(1)
+    if step_after == "CONFIRM":
+        await send_telegram_message(chat_id, build_confirmation_text(state))
+    else:
+        await send_telegram_message(chat_id, question_for_step(step_after))
 
-# ===== تسجيل webhook عند بدء التشغيل =====
-async def set_webhook():
-    if not WEBHOOK_URL:
-        logger.warning("WEBHOOK_URL غير معرّف، سيتم استخدام polling بدلاً من ذلك.")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}"
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.get(url)
-            data = res.json()
-            if data.get("ok"):
-                logger.info(f"✅ Webhook تم تسجيله بنجاح: {WEBHOOK_URL}")
-                return True
-            else:
-                logger.error(f"❌ فشل تسجيل webhook: {data}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ استثناء أثناء تسجيل webhook: {e}")
-            return False
+async def start_guided_flow(chat_id: int, prefill: dict):
+    workers = int(prefill.get("workers_count") or 0) or None
+    hours = prefill.get("hours") or None
+    wage_per_hour = prefill.get("wage_per_hour") or None
+    wage_per_worker = prefill.get("wage_per_worker") or None
+    expenses = prefill.get("expenses")
+    date_val = prefill.get("date") or datetime.now().strftime("%Y-%m-%d")
 
-@app.on_event("startup")
-async def startup_event():
-    # حاول تسجيل webhook
-    success = await set_webhook()
-    if not success:
-        logger.warning("سيتم تشغيل polling كحل احتياطي.")
-        import asyncio
-        asyncio.create_task(polling_loop())
+    wage_mode = None
+    if wage_per_worker:
+        wage_mode = "daily"
+    elif hours and wage_per_hour:
+        wage_per_worker = hours * wage_per_hour
+        wage_mode = "hourly"
 
-# ===== تشغيل التطبيق =====
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    state = {
+        "date": date_val, "workers_count": workers, "wage_mode": wage_mode,
+        "hours": hours, "wage_per_hour": wage_per_hour,
+        "wage_per_worker": wage_per_worker,
+        "expenses": expenses if expenses not in (None, 0) else (0.0 if expenses == 0 else None),
+        "notes": ""
+    }
+
+    step = next_missing_step(state)
+    save_state(chat_id, step=step, **state)
+
+    if step == "CONFIRM":
+        await send_telegram_message(chat_id, build_confirmation_text(state))
+    else:
+        intro = "تمام، خلينا نكمل التفاصيل 👇\n\n" if workers or wage_per_worker else ""
+        await send_telegram_message(chat_id, intro + question_for_step(step))
+
+# ===== دوال التحديث والتقارير =====
+def query_records(date_from: str = None, date_to: str = None):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    if date_from and date_to:
+        cursor.execute(
+            "SELECT date, workers_count, wage_per_worker, expenses, notes "
+            "FROM daily_records WHERE date BETWEEN ? AND ? ORDER BY date ASC",
+            (date_from, date_to)
+        )
+    else:
+        cursor.execute(
+            "SELECT date, workers_count, wage_per_worker, expenses, notes "
+            "FROM daily_records ORDER BY date ASC"
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def format_text_report(rows, title: str) -> str:
+    if not rows:
+        return f"{title}\n\nلا توجد أي سجلات لهذه الفترة."
+    lines = [title, ""]
+    grand_total = 0.0
+    for date, count, wage, exp, notes in rows:
+        total = (count * wage) + exp
+        grand_total += total
+        lines.append(f"📅 {date} | عمال: {count} | أجرة/عامل: {wage:.2f} | مصاريف: {exp:.2f} | المجموع: {total:.2f}")
+        if notes:
+            lines.append(f"   ملاحظات: {notes}")
+    lines.append("")
+    lines.append(f"🏆 الإجمالي الكلي: {grand_total:.2f} د.أ")
+    return "\n".join(lines)
+
+def generate_excel_report(rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "تقرير المزرعة"
+    headers = ["التاريخ", "عدد العمال", "أجرة العامل (د.أ)", "المصاريف (د.أ)", "المجموع (د.أ)", "ملاحظات"]
+    ws.append(headers)
+    for date, count, wage, exp, notes in rows:
+        total = (count * wage) + exp
+        ws.append([date, count, wage, exp, total, notes])
+    wb.save("temp_report.xlsx")
+    with open("temp_report.xlsx", "rb") as f:
+        data = f.read()
+    os.r
