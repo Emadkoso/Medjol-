@@ -15,7 +15,8 @@ logger = logging.getLogger("medjol")
 app = FastAPI()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 DB_NAME = "harvest.db"
@@ -60,9 +61,9 @@ async def send_telegram_document(chat_id: int, filename: str, content: bytes, ca
         except Exception as e:
             logger.error(f"Telegram sendDocument exception: {e}")
 
-async def parse_with_groq(text: str) -> dict:
-    if not GROQ_API_KEY:
-        logger.error("GROQ_API_KEY is missing from environment variables!")
+async def parse_with_ai(text: str) -> dict:
+    if not OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY is missing from environment variables!")
         return {}
 
     prompt = f"""
@@ -80,12 +81,15 @@ async def parse_with_groq(text: str) -> dict:
     """
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # اختياري لكن موصى فيه من OpenRouter لتحديد هوية التطبيق
+        "HTTP-Referer": "https://medjol.onrender.com",
+        "X-Title": "Medjol Farm Bot"
     }
 
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "response_format": {"type": "json_object"}
@@ -94,23 +98,22 @@ async def parse_with_groq(text: str) -> dict:
     async with httpx.AsyncClient() as client:
         try:
             res = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=20.0
+                timeout=25.0
             )
             if res.status_code == 200:
                 result = res.json()
                 content = result['choices'][0]['message']['content']
-                logger.info(f"Groq raw response: {content}")
+                logger.info(f"OpenRouter raw response: {content}")
                 return json.loads(content)
             else:
-                # هذا السطر هو الأهم — رح يطلعلنا سبب الفشل الحقيقي بالـ logs
-                logger.error(f"Groq API error {res.status_code}: {res.text}")
+                logger.error(f"OpenRouter API error {res.status_code}: {res.text}")
         except json.JSONDecodeError as e:
-            logger.error(f"Groq returned invalid JSON: {e}")
+            logger.error(f"OpenRouter returned invalid JSON: {e}")
         except Exception as e:
-            logger.error(f"Groq request exception: {e}")
+            logger.error(f"OpenRouter request exception: {e}")
     return {}
 
 def generate_pdf_report():
@@ -219,7 +222,7 @@ async def telegram_webhook(request: Request):
             excel_data = generate_excel_report()
             await send_telegram_document(chat_id, "report.xlsx", excel_data, "إليك تقرير الحسابات بصيغة Excel")
         else:
-            parsed = await parse_with_groq(text)
+            parsed = await parse_with_ai(text)
             w_count = parsed.get("workers_count", 0) or 0
             wage = float(parsed.get("wage_per_worker", 0.0) or 0.0)
             exp = float(parsed.get("expenses", 0.0) or 0.0)
