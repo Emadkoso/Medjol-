@@ -490,7 +490,7 @@ async def start_guided_flow(chat_id: int, prefill: dict):
 
 
 # ---------------------------------------------------------------------------
-# Update / Report helpers (كما هي)
+# Update / Report helpers
 # ---------------------------------------------------------------------------
 
 def query_records(date_from: str = None, date_to: str = None):
@@ -513,10 +513,10 @@ def query_records(date_from: str = None, date_to: str = None):
 
 
 def format_text_report(rows, title: str) -> str:
+    """توليد تقرير نصي من الصفوف."""
     if not rows:
         return f"{title}\n\nلا توجد أي سجلات لهذه الفترة."
     lines = [title, ""]
     grand_total = 0.0
     for date, count, wage, exp, notes in rows:
-        total = (count * wage) + exp
-   
+        tota
