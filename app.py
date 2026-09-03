@@ -1,4 +1,4 @@
-# app.py - نسخة Polling مع حذف webhook تلقائياً
+# app.py - النسخة النهائية مع إصلاح step المكرر
 
 import os
 import re
@@ -352,8 +352,13 @@ async def handle_guided_answer(chat_id: int, text: str, state: dict):
         else:
             await send_telegram_message(chat_id, "اكتب 'نعم' أو 'الغاء'.")
         return
+
+    # ========== التصحيح هنا ==========
+    # نضبط step داخل state ثم نمرر state كله
     step_after = next_missing_step(state)
-    save_state(chat_id, step=step_after, **state)
+    state['step'] = step_after
+    save_state(chat_id, **state)
+
     if step_after == "CONFIRM":
         await send_telegram_message(chat_id, build_confirmation_text(state))
     else:
@@ -380,7 +385,8 @@ async def start_guided_flow(chat_id: int, prefill: dict):
         "notes": ""
     }
     step = next_missing_step(state)
-    save_state(chat_id, step=step, **state)
+    state['step'] = step
+    save_state(chat_id, **state)
     if step == "CONFIRM":
         await send_telegram_message(chat_id, build_confirmation_text(state))
     else:
@@ -568,7 +574,6 @@ async def handle_incoming_message(chat_id: int, text: str):
 
 # ========== حلقة Polling مع حذف webhook ==========
 async def delete_webhook():
-    """حذف أي webhook مسجل مسبقاً"""
     if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
@@ -587,7 +592,7 @@ async def delete_webhook():
             logger.error(f"⚠️ استثناء أثناء حذف webhook: {e}")
 
 async def polling_loop():
-    await delete_webhook()  # حذف أي webhook موجود قبل بدء polling
+    await delete_webhook()
     offset = 0
     logger.info("🔄 بدء polling...")
     while True:
