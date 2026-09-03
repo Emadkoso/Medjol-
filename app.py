@@ -1,5 +1,4 @@
-# app.py - نسخة نهائية تعتمد على Polling فقط (بدون Webhook)
-# انسخ هذا الكود بالكامل وألصقه في ملف app.py على Render
+# app.py - نسخة Polling مع حذف webhook تلقائياً
 
 import os
 import re
@@ -567,8 +566,28 @@ async def handle_incoming_message(chat_id: int, text: str):
         logger.error(f"Error: {e}", exc_info=True)
         await send_telegram_message(chat_id, "❌ حدث خطأ، حاول لاحقاً.")
 
-# ========== حلقة Polling ==========
+# ========== حلقة Polling مع حذف webhook ==========
+async def delete_webhook():
+    """حذف أي webhook مسجل مسبقاً"""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("ok"):
+                    logger.info("✅ تم حذف webhook القديم بنجاح")
+                else:
+                    logger.warning(f"⚠️ فشل حذف webhook: {data}")
+            else:
+                logger.warning(f"⚠️ فشل حذف webhook: {res.status_code}")
+        except Exception as e:
+            logger.error(f"⚠️ استثناء أثناء حذف webhook: {e}")
+
 async def polling_loop():
+    await delete_webhook()  # حذف أي webhook موجود قبل بدء polling
     offset = 0
     logger.info("🔄 بدء polling...")
     while True:
@@ -597,7 +616,7 @@ async def startup_event():
         logger.error("❌ TELEGRAM_BOT_TOKEN غير موجود")
         return
     asyncio.create_task(polling_loop())
-    logger.info("✅ البوت يعمل عبر polling")
+    logger.info("✅ البوت يعمل عبر polling (تم حذف أي webhook سابق)")
 
 @app.get("/")
 async def root():
